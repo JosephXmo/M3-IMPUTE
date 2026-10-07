@@ -1,3 +1,11 @@
+"""Dataset loading and sample-feature graph construction for UCI-style data.
+
+Each row in ``data.txt`` is interpreted as one sample.  The last column is the
+regression target and the preceding columns are the attributes to impute.  The
+attributes become feature nodes; every sample is connected to every feature by
+two directed edges so the GNN can pass messages in both directions.
+"""
+
 import pandas as pd
 import os.path as osp
 import inspect
@@ -5,13 +13,17 @@ from torch_geometric.data import Data
 from sklearn import preprocessing
 
 import torch
-import random
 import numpy as np
-import pdb
 
 from utils.utils import get_known_mask, mask_edge, train_test_mask
 
 def create_node(df, mode):
+    """Create initial node features for sample and feature nodes.
+
+    ``mode=0`` is the original default: samples start with an all-one vector
+    and feature nodes use one-hot vectors.  ``mode=1`` adds a dedicated sample
+    indicator column.  The node order is always ``[samples, features]``.
+    """
     if mode == 0: # onehot feature node, all 1 sample node
         nrow, ncol = df.shape
         feature_ind = np.array(range(ncol))
@@ -33,17 +45,19 @@ def create_node(df, mode):
     return node
 
 def create_edge(df):
+    """Return the complete directed bipartite sample-feature edge list."""
     n_row, n_col = df.shape
     edge_start = []
     edge_end = []
     for x in range(n_row):
-        edge_start = edge_start + [x] * n_col # obj
-        edge_end = edge_end + list(n_row+np.arange(n_col)) # att    
+        edge_start = edge_start + [x] * n_col # sample node
+        edge_end = edge_end + list(n_row+np.arange(n_col)) # feature node
     edge_start_new = edge_start + edge_end
     edge_end_new = edge_end + edge_start
     return (edge_start_new, edge_end_new)
 
 def create_edge_attr(df):
+    """Use the normalized cell value as a scalar attribute on each edge."""
     nrow, ncol = df.shape
     edge_attr = []
     for i in range(nrow):
@@ -53,48 +67,55 @@ def create_edge_attr(df):
     return edge_attr
 
 def get_data(df_X, df_y, node_mode, train_edge_prob, split_sample_ratio, split_by, train_y_prob, seed=0, normalize=True, args=None):
+    """Convert tabular data into a PyG ``Data`` object.
+
+    The graph topology is complete before masking.  ``train_edge_prob`` (or
+    the selected MCAR/MAR/MNAR policy) decides which cells are visible during
+    training; the complementary edges become the imputation test set.
+    """
     if len(df_y.shape)==1:
         df_y = df_y.to_numpy()
     elif len(df_y.shape)==2:
         df_y = df_y[0].to_numpy()
 
     if normalize:
+        # The model predicts normalized edge values.  Keep ``df_y`` separate:
+        # it is used for the downstream target split and is not an imputation
+        # feature node.
         x = df_X.values
         min_max_scaler = preprocessing.MinMaxScaler()
         x_scaled = min_max_scaler.fit_transform(x)      # 将raw data feature (0.3, 0.7, ...)用min_max norm一下
         df_X = pd.DataFrame(x_scaled)                   # 转换为DataFrame形式
 
-    # 创建边
+    # Build the complete bidirectional sample-feature graph once.  Later masks
+    # select train/test edges without changing node indices.
     edge_start, edge_end = create_edge(df_X)
     edge_index = torch.tensor([edge_start, edge_end], dtype=int)
     edge_attr = torch.tensor(create_edge_attr(df_X), dtype=torch.float)
-    # print(edge_index, edge_index.shape)
-    # print(edge_attr.shape)
-    # print(edge_attr)
-
-    # node_init = __create_node(df_X, node_mode)
+    # Node rows are ordered as samples first and features second; this order is
+    # relied on by the GNN and by ImputeNet.get_imp_obs_fea_pair_index().
     node_init = create_node(df_X, node_mode) 
     x = torch.tensor(node_init, dtype=torch.float)
     y = torch.tensor(df_y, dtype=torch.float)
     
     print(f'[Config] Known Ratio (i.e. Training Edge Ratio): {train_edge_prob}, Missing Ratio (i.e. Testing Impute Edge Ratio): {1 - train_edge_prob}')
 
-    #set seed to fix known/unknwon edges
+    # Fix the initial train/test split for reproducible experiments.
     torch.manual_seed(seed)
-    #keep train_edge_prob of all edges
+    # Keep the selected fraction of undirected cells.  Both directions receive
+    # the same mask so the graph remains symmetric at the cell level.
     train_edge_mask = train_test_mask(train_edge_prob, int(edge_attr.shape[0]/2), mode=args.corrupt, mask_dist=args.masking_distribution, X=df_X, args=args)
     # train_edge_mask = get_known_mask(train_edge_prob, int(edge_attr.shape[0]/2), args.masking_distribution)
     double_train_edge_mask = torch.cat((train_edge_mask, train_edge_mask), dim=0)
 
-    # mask edges based on the generated train_edge_mask
-    # train_edge_index is known, test_edge_index in unknwon, i.e. missing
+    # ``train_edge_*`` are observed cells; ``test_edge_*`` are hidden cells.
     train_edge_index, train_edge_attr = mask_edge(edge_index, edge_attr,
                                                 double_train_edge_mask, True)
     train_labels = train_edge_attr[:int(train_edge_attr.shape[0]/2),0]
     test_edge_index, test_edge_attr = mask_edge(edge_index, edge_attr,
                                                 ~double_train_edge_mask, True)
     test_labels = test_edge_attr[:int(test_edge_attr.shape[0]/2),0]
-    #mask the y-values during training, i.e. how we split the training and test sets
+    # The target column has its own sample split for downstream evaluation.
     train_y_mask = get_known_mask(train_y_prob, y.shape[0], args.masking_distribution)
     test_y_mask = ~train_y_mask
 
@@ -110,6 +131,8 @@ def get_data(df_X, df_y, node_mode, train_edge_prob, split_sample_ratio, split_b
             )
 
     if split_sample_ratio > 0.:
+        # Optional cold-start split: keep the graph topology but partition
+        # sample rows into lower/higher groups according to y or at random.
         if split_by == 'y':
             sorted_y, sorted_y_index = torch.sort(torch.reshape(y,(-1,)))
         elif split_by == 'random':
@@ -169,8 +192,10 @@ def get_data(df_X, df_y, node_mode, train_edge_prob, split_sample_ratio, split_b
     return data
 
 def load_data(args):
+    """Load ``uci/raw_data/<name>/data/data.txt`` using CLI arguments."""
     uci_path = osp.dirname(osp.abspath(inspect.getfile(inspect.currentframe())))
-    df_np = np.loadtxt(uci_path+'/raw_data/{}/data/data.txt'.format(args.data))
+    data_path = osp.join(uci_path, 'raw_data', args.data, 'data', 'data.txt')
+    df_np = np.loadtxt(data_path)
     df_y = pd.DataFrame(df_np[:, -1:])
     df_X = pd.DataFrame(df_np[:, :-1])
     if not hasattr(args,'split_sample'):
@@ -178,5 +203,4 @@ def load_data(args):
     
     data = get_data(df_X, df_y, args.node_mode, args.train_edge, args.split_sample, args.split_by, args.train_y, args.seed, args=args)
     return data
-
 

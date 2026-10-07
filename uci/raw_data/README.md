@@ -6,6 +6,7 @@ The datasets used in this work can obtains online or import from the suppmentary
   - concrete, energy, housing, kin8nm, naval, power, wine, yacht
 - Extra 16 datasets: 
   - airfoil, blood, breast, diabetes, ionosphere, iris, wine-white, protein, spam, letter, ai4i, cmc, german, steel, libras, california-housing
+- UCI-HAR: `har/original` contains the source distribution; run `har/preprocess.py` to create `har/data`.
 
 
 Expected folder structure:

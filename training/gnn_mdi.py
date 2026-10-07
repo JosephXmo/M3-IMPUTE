@@ -1,3 +1,10 @@
+"""Training loop for the graph encoder and M^3-Impute predictor.
+
+The loop performs self-supervised edge dropout: a subset of known training
+cells is hidden for the current step, then the model predicts all training
+cells and receives reconstruction loss against the original values.
+"""
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -12,6 +19,7 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 
 def get_known_A_during_training(A, Known_Mask, train_removed_edges, tgt_v, n_of_record=None, device=None, epsilon=1e-4):
+    """Apply the current step's hidden-edge mask to ``A`` and ``Known_Mask``."""
     A = A.clone().detach().to(device)
     Known_Mask = Known_Mask.clone().detach().to(device)
 
@@ -30,13 +38,16 @@ def get_known_A_during_training(A, Known_Mask, train_removed_edges, tgt_v, n_of_
 
 
 def eliminate_feature_index(list_of_index, tgt_v):
-    """
-    Since list_of_index is sorted (i.e. [1,2,3,4,5]), we want to use Binary search to find the first position $i$, 
-    such that list_of_index[i-1] < tgt_v <= list_of_index[i]
-    """
+    """Find the boundary where feature-node indices begin in a sorted edge list."""
     return torch.searchsorted(list_of_index, tgt_v, right=False)
 
 def reconstruct_known_missing_A(shape, edges, attr, n_of_record, epsilon=1e-4, device=None, idx=None):
+    """Build the dense value matrix and binary visibility mask for one split.
+
+    ``A`` carries observed values and ``epsilon`` at hidden cells. ``M`` is
+    kept separate so zero-valued observations remain distinguishable from
+    missing values.
+    """
     # Build a matrix of shape: (Num of record, num of feature) 
     # initially, fill in value with nan
     A = torch.full(shape, torch.nan, requires_grad=False).to(device)
@@ -60,6 +71,10 @@ def reconstruct_known_missing_A(shape, edges, attr, n_of_record, epsilon=1e-4, d
 
 
 def train_gnn_mdi(data, args, log_path, run_iter_num, device=torch.device('cpu'), print_train_log=False):
+    """Train one repeat and persist curves, predictions, and optional models."""
+    # The two modules are optimized together: GNNStack creates node embeddings
+    # from the currently visible graph, and ImputeNet predicts hidden cells from
+    # those embeddings plus the visibility mask.
     model = get_gnn(data, args, device).to(device)
     if args.impute_hiddens == '':
         impute_hiddens = []
@@ -77,13 +92,15 @@ def train_gnn_mdi(data, args, log_path, run_iter_num, device=torch.device('cpu')
     num_nodes, num_feature = data.x.shape
     num_record = num_nodes - num_feature
 
-    # train
+    # Curves are kept in Python lists so they can be serialized to result.pkl.
     Train_loss = []
     Test_rmse = []
     Test_l1 = []
     Lr = []
 
     x = data.x.clone().detach().to(device)
+    # Select the edge split used by this run.  ``split_sample`` optionally
+    # replaces the ordinary train/test view with lower/higher sample groups.
     if hasattr(args,'split_sample') and args.split_sample > 0.:
         if args.split_train:
             all_train_edge_index = data.lower_train_edge_index.clone().detach().to(device)
@@ -113,6 +130,8 @@ def train_gnn_mdi(data, args, log_path, run_iter_num, device=torch.device('cpu')
         test_labels = data.test_labels.clone().detach().to(device)
     if hasattr(data,'class_values'):
         class_values = data.class_values.clone().detach().to(device)
+    # Validation removes a fixed subset of train cells from the input graph;
+    # their labels remain available only for model selection.
     if args.valid > 0.:
         valid_mask = get_known_mask(args.valid, int(all_train_edge_attr.shape[0] / 2), args.masking_distribution).to(device)
         # print("valid mask sum: ",torch.sum(valid_mask))
@@ -146,13 +165,14 @@ def train_gnn_mdi(data, args, log_path, run_iter_num, device=torch.device('cpu')
     obj['outputs'] = dict()
     
 
-    # --------------------------------------------Start Training & Testing --------------------------------------------#
-    # 1. obtain the idx for the last record
+    # -------------------- Build the imputation state --------------------
+    # Find the first feature-node edge in the duplicated directed list.  The
+    # first half contains sample -> feature edges and is enough to reconstruct
+    # the dense sample-feature matrix.
     tgt_v = torch.tensor([num_record], dtype=int, device=device)
     idx = eliminate_feature_index(train_edge_index[0], tgt_v)
-    # 2. reconstruct adjacency matrix (Num_sample, num_feature)
-    # (1) Observable: fill in with edge value
-    # (2) Missing:    fill in with epsilon
+    # ``A`` stores values (epsilon at hidden cells); ``Known_Mask`` stores the
+    # binary visibility information used by FCU/SRU.
     A, Known_Mask = reconstruct_known_missing_A((num_record, num_feature), train_edge_index, train_edge_attr, num_record, device=device, idx=idx, epsilon=args.init_epsilon)
     
     impute_model = ImputeNet(hidden_dim = args.node_dim,
@@ -173,35 +193,37 @@ def train_gnn_mdi(data, args, log_path, run_iter_num, device=torch.device('cpu')
     trainable_parameters = list(model.parameters()) \
                            + list(impute_model.parameters())
     # print("total trainable_parameters: ",len(trainable_parameters))
-    # build optimizer
+    # Build one optimizer over both the encoder and imputation head.
     scheduler, opt = build_optimizer(args, trainable_parameters)
 
+    # -------------------------- Optimization --------------------------
     for epoch in tqdm(range(args.epochs)):
         model.train()               # GNN encoder
         impute_model.train()        # Imputer
 
-        # update cosine similarity every args.update_cos_sample_prob_every epochs:
+        # Cosine-based SRU sampling caches a peer distribution and refreshes it
+        # periodically.  Random sampling does not need this cache.
         if args.apply_peer == True and args.sample_strategy == 'cos-similarity' and (epoch + 1) % args.update_cos_sample_prob_every == 0:
             print('[SRU] Update Sample Space')
             impute_model.SRU.update_cos_prob(model.feature_nodes, Train_A)
 
-        # maskout edge during training :
+        # Hide a fresh subset of observed cells for self-supervision.  The
+        # hidden labels are still used as reconstruction targets below.
         known_mask = get_known_mask(args.known, int(train_edge_attr.shape[0] / 2), args.masking_distribution).to(device)
         double_known_mask = torch.cat((known_mask, known_mask), dim=0)
         known_edge_index, known_edge_attr, removed_edge_index = mask_edge(train_edge_index, train_edge_attr, double_known_mask, True, keep_removed=True)
         
-        # reset grad
+        # -------------------------- Train step -------------------------
         opt.zero_grad()
 
-        # get the reconstruct adjacency matrix for this training epoch, as some of the edges are mask out
-        # (1) Observable: fill in with edge value
-        # (2) Missing:    fill in with epsilon
+        # Rebuild the dense input state so the encoder cannot read this step's
+        # held-out values through either edge attributes or the mask.
         Train_A, Train_Known_mask = get_known_A_during_training(A, Known_Mask, removed_edge_index, tgt_v, n_of_record=num_record, device=device, epsilon=args.init_epsilon)
 
-        # perform graph representation learning:
+        # Encode the masked bipartite graph.
         x_embd = model(x, known_edge_attr, known_edge_index, Train_A)    # Input shape: (#Obs + #Fea, #feature)
         
-        # perform FCU, SCU:
+        # Predict the target edges with the optional FCU and SRU context units.
         pred, _ = impute_model(obs_nodes_embs=x_embd[: num_record], fea_nodes_embs=x_embd[num_record:], known_edges=known_edge_index, impute_target_edges=train_edge_index, known_mask=Train_Known_mask)
 
         if hasattr(args,'ce_loss') and args.ce_loss:
@@ -224,10 +246,13 @@ def train_gnn_mdi(data, args, log_path, run_iter_num, device=torch.device('cpu')
         for param_group in opt.param_groups:
             Lr.append(param_group['lr'])
 
+        # ------------------------- Evaluation --------------------------
         model.eval()
         impute_model.eval()
         with torch.no_grad():
             if args.valid > 0.:
+                # Validation uses all ordinary training edges as context and
+                # evaluates only the held-out validation labels.
                 x_embd = model(x, train_edge_attr, train_edge_index, A)
                 pred, _ = impute_model(obs_nodes_embs=x_embd[: num_record], fea_nodes_embs=x_embd[num_record:],known_edges=train_edge_index, impute_target_edges=valid_edge_index, known_mask=Known_Mask)
                 
@@ -261,6 +286,10 @@ def train_gnn_mdi(data, args, log_path, run_iter_num, device=torch.device('cpu')
                 Valid_rmse.append(valid_rmse)
                 Valid_l1.append(valid_l1)
 
+            # Test inference sees the chosen input graph and predicts the
+            # disjoint test cells.  Metrics are computed in normalized space
+            # unless the optional classification/label-normalization branches
+            # are enabled by the caller.
             x_embd = model(x, test_input_edge_attr, test_input_edge_index, A)
             pred, _ = impute_model(obs_nodes_embs=x_embd[: num_record], fea_nodes_embs=x_embd[num_record:],known_edges=test_input_edge_index, impute_target_edges=test_edge_index, known_mask=Known_Mask)
 
@@ -302,6 +331,9 @@ def train_gnn_mdi(data, args, log_path, run_iter_num, device=torch.device('cpu')
                 print('test rmse: ', test_rmse)
                 print('test l1: ', test_l1)
 
+    # --------------------------- Persist run ---------------------------
+    # Convert tensors to NumPy before pickling so result.pkl is easy to inspect
+    # without recreating the training device.
     pred_train = pred_train.detach().cpu().numpy()
     label_train = label_train.detach().cpu().numpy()
     pred_test = pred_test.detach().cpu().numpy()

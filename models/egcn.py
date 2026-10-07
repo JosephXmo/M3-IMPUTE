@@ -1,3 +1,5 @@
+"""Edge-aware GCN message-passing layer used by :mod:`models.gnn_model`."""
+
 import torch
 from torch.nn import Parameter
 from torch_scatter import scatter_add
@@ -10,7 +12,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class EGCNConv(MessagePassing):
-    # form https://pytorch-geometric.readthedocs.io/en/latest/_modules/torch_geometric/nn/conv/gcn_conv.html#GCNConv
+    """GCN-style propagation that can weight or transform edge attributes."""
+    # Form adapted from the PyTorch Geometric GCNConv implementation.
     def __init__(self, in_channels, out_channels,
                  edge_channels, edge_mode,
                  improved=False, cached=False,
@@ -65,7 +68,7 @@ class EGCNConv(MessagePassing):
 
 
     def forward(self, x, edge_attr, edge_index, edge_weight=None):
-        """"""
+        """Propagate node states while retaining the original edge ordering."""
         x = torch.matmul(x, self.weight)
 
         if self.cached and self.cached_result is not None:

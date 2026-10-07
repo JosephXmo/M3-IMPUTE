@@ -1,3 +1,16 @@
+"""Mask-guided prediction modules for M^3-Impute.
+
+The predictor has two optional context units:
+
+* FCU (feature relation): uses correlations between the target feature and
+  the other features observed for the same sample.
+* SRU (sample relation): samples peer records and aggregates their compatible
+  context for the same target feature.
+
+Both units return a hidden representation for each target edge.  The final
+MLP maps that representation to the normalized scalar edge value.
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,6 +19,7 @@ import time
 from utils.utils import get_activation
 
 class Attr_Relation_Net(nn.Module):
+    """Feature-context unit (FCU) for one target sample-feature pair."""
     def __init__(self, hidden_dim=None, num_of_feature=None, device=None, drop_p=0.1):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -37,8 +51,8 @@ class Attr_Relation_Net(nn.Module):
         ).to(self.device)
     
     def forward(self, known_mask, obs_idx, obs_mask_idx, attr_idx_need_to_be_impute, obs_embs, fea_corr):
-        # obtain obs embdedding and feature embedding according to indices.
-        # shape should be: (number of pairs need to impute, dim)
+        # Select the sample representation for every target edge.  All tensors
+        # below are aligned on the first dimension: number of target pairs.
         obs_h = obs_embs[obs_idx]
 
         m_i = known_mask[obs_mask_idx]
@@ -47,7 +61,7 @@ class Attr_Relation_Net(nn.Module):
         # get feature correlation:
         a_j_i = fea_corr[attr_idx_need_to_be_impute]        # (n, m)
 
-        # soft masking
+        # Softly suppress the target feature and currently missing features.
         m_J_I = F.softmax(m_i * m_j, dim=1)
         m_J_I = self.phi_rm(m_J_I)                                      # (n, m)
 
@@ -60,9 +74,7 @@ class Attr_Relation_Net(nn.Module):
         return c_r_ji
 
 class Attr_Relation_Net_SRU(nn.Module):
-    """
-    A variant of class Attr_Relation_Net, optimized for the SRU unit
-    """
+    """Vectorized FCU variant used for a batch of sampled peer records."""
     def __init__(self, hidden_dim=None, num_of_feature=None, device=None, drop_p=0.1):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -119,6 +131,7 @@ class Attr_Relation_Net_SRU(nn.Module):
         return c_r_ji
 
 class Similariy_Net(nn.Module):
+    """Sample relation unit (SRU) with random or cosine-based peer sampling."""
     def __init__(self, hidden_dim=None, 
                        num_of_record=None,
                        num_of_feature=None,
@@ -193,6 +206,11 @@ class Similariy_Net(nn.Module):
         self.sample_space = torch.randint(0, self.num_record, (self.sample_space_size, )).to(self.device)      # (K,), K = sample space size
 
     def update_cos_prob(self, feature_node_embs, attn_score):
+        """Refresh the peer-sampling table from current feature embeddings.
+
+        The normal path stores an N x N table.  ``running_on_large_dataset``
+        replaces it with an N x K table by sampling a smaller candidate space.
+        """
         if hasattr(self, 'sample_prob'):
             del self.sample_prob
             torch.cuda.empty_cache()
@@ -236,6 +254,12 @@ class Similariy_Net(nn.Module):
     
 
     def sample_peer(self, KNOWN_Adjacency_matrix, N_of_Imputation, IMP_OBS_IDX):
+        """Return peer indices for every target pair.
+
+        ``KNOWN_Adjacency_matrix`` is retained in the signature for compatibility
+        with earlier experiments; the current strategies use the cached
+        sampling table or random indices.
+        """
         if self.sample_strategy is None or self.sample_strategy == 'random_sample':
             # print('[SYS]: Sample Strategy: RANDOM')
             sampled = torch.randint(0, self.num_record, (N_of_Imputation, self.sample_peer_size)).to(self.device)
@@ -253,6 +277,7 @@ class Similariy_Net(nn.Module):
         return sampled
     
     def forward(self, M, OBS_embs, IMP_OBS_index, IMP_FEA_index, fea_corr):
+        """Aggregate peer context and return ``(context, similarity)``."""
         # M: (n, m)
         N = IMP_OBS_index.size(0)                                   # Get the number of paris that need to be imputed.
         K = self.sample_peer_size
@@ -301,6 +326,7 @@ class Similariy_Net(nn.Module):
 
 
 class ImputeNet(nn.Module):
+    """Fuse FCU/SRU contexts and predict normalized missing cell values."""
     def __init__(self, hidden_dim=None, 
                        num_of_record=None,
                        num_of_feature=None,
@@ -357,19 +383,25 @@ class ImputeNet(nn.Module):
         ).to(self.device)
     
     def get_imp_obs_fea_pair_index(self, impute_target):
-        # obtain obs_node index and target imputation feature index
+        """Convert duplicated directed target edges to sample/feature indices.
+
+        The data loader stores sample-to-feature edges first and their reverse
+        copies second.  The first edge whose source is a feature node marks the
+        boundary between these two halves.
+        """
         end1, end2 = impute_target
         idx  = torch.ge(end1, self.num_record)
         idx = torch.nonzero(idx).squeeze(dim=1)[0].item()
 
         obs_idx                    = torch.cat((end1[:idx], end2[idx:]), dim=0).to(self.device)
-        attr_idx_need_to_be_impute = torch.cat((end2[:idx], end1[idx:]), dim=0) - self.num_record
-        attr_idx_need_to_be_impute.to(self.device)
+        attr_idx_need_to_be_impute = (
+            torch.cat((end2[:idx], end1[idx:]), dim=0) - self.num_record
+        ).to(self.device)
 
         return obs_idx, attr_idx_need_to_be_impute
 
     def sim_confidence(self, similarity):
-        # similiary shape: (N, #peer)
+        """Map peer similarities to a bounded fusion weight in [approximately 0, 1]."""
         similarity = torch.abs(similarity.float())
         z = self.sim_conf_net(similarity)
 
@@ -378,27 +410,33 @@ class ImputeNet(nn.Module):
         return z
     
     def forward(self, obs_nodes_embs, fea_nodes_embs, known_edges, impute_target_edges, known_mask=None):
-        # obtain the index for observation nodes and corresponding imputing attributes
+        """Predict values for target edges using the supplied node embeddings.
+
+        ``known_mask`` is the dense N x M visibility matrix used by FCU/SRU;
+        ``known_edges`` remains part of the public API for compatibility with
+        the original training loop.
+        """
+        # Obtain the observation node and target feature for every directed
+        # target edge, then compute feature correlations once per forward pass.
         IMP_OBS_IDX, IMP_FEA_IDX = self.get_imp_obs_fea_pair_index(impute_target_edges)         # (N, 1) for each IDX; N denotes the number of attributes that need to be imputed;
-        # compute feature correlations once and reuse for this epoch/forward run:
         feature_corr = fea_nodes_embs @ fea_nodes_embs.t()                                      # (m, m)
 
-        if self.apply_relation:
+        if self.apply_relation and self.apply_peer:
             c_r = self.FCU(known_mask, IMP_OBS_IDX, IMP_OBS_IDX, IMP_FEA_IDX, obs_nodes_embs, feature_corr)    # c_r: (N, dim)
-
-        if self.apply_peer:
-            c_s, similarity = self.SRU(known_mask, obs_nodes_embs, IMP_OBS_IDX, IMP_FEA_IDX, feature_corr)      # c_s: (N, dim); similairty: (N, sample_size)
-
-        if not self.apply_relation:
-            # print('apply peer')
-            imputed_value = self.post_neural_net(c_s)
-        elif not self.apply_peer:
-            # print('apply relation')
-            imputed_value = self.post_neural_net(c_r)
-        else:
-            # print('apply both')
+            c_s, similarity = self.SRU(known_mask, obs_nodes_embs, IMP_OBS_IDX, IMP_FEA_IDX, feature_corr)      # c_s: (N, dim); similarity: (N, sample_size)
             sim_conf = self.sim_confidence(similarity)
             imputed_value = self.post_neural_net((1 - sim_conf) * c_r + sim_conf * c_s)
+        elif self.apply_relation:
+            c_r = self.FCU(known_mask, IMP_OBS_IDX, IMP_OBS_IDX, IMP_FEA_IDX, obs_nodes_embs, feature_corr)
+            imputed_value = self.post_neural_net(c_r)
+        elif self.apply_peer:
+            c_s, _ = self.SRU(known_mask, obs_nodes_embs, IMP_OBS_IDX, IMP_FEA_IDX, feature_corr)
+            imputed_value = self.post_neural_net(c_s)
+        else:
+            # Baseline path: combine the sample and target-feature embeddings
+            # directly when both context units are disabled.
+            base_edge = obs_nodes_embs[IMP_OBS_IDX] * fea_nodes_embs[IMP_FEA_IDX]
+            imputed_value = self.post_neural_net(base_edge)
         
         
         return imputed_value, 0

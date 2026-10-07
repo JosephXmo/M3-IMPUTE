@@ -1,16 +1,22 @@
-import numpy as np
+"""Graph encoder used by M^3-Impute.
+
+The encoder operates on a bidirectional sample-feature graph.  ``train_attr_value``
+is the dense sample-feature matrix used to initialize sample nodes; the input
+``x`` argument is kept in the public signature for compatibility with the
+original GRAPE-style training code.
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 import torch_geometric.nn as pyg_nn
-import torch_geometric.utils as pyg_utils
 from models.egcn import EGCNConv
 from models.egsage import EGraphSage
 from utils.utils import get_activation
-from time import time
 
 def get_gnn(data, args, device):
+    """Build a :class:`GNNStack` from dataset metadata and CLI arguments."""
     model_types = args.model_types.split('_')
     if args.norm_embs is None:
         norm_embs = [True,]*len(model_types)
@@ -23,7 +29,9 @@ def get_gnn(data, args, device):
         
     print(f'[Config] GNN model: {model_types}')
     
-    # build model
+    # ``data.x`` contains sample and feature nodes.  Its second dimension is
+    # the node-feature width, which equals the number of data features in the
+    # default node mode used by this repository.
     total_number_of_nodes, number_of_feature_nodes = data.x.shape
     number_of_nodes = total_number_of_nodes - number_of_feature_nodes
 
@@ -35,6 +43,11 @@ def get_gnn(data, args, device):
     return model
 
 class GNNStack(torch.nn.Module):
+    """Stack edge-aware message-passing layers and edge update MLPs.
+
+    Each layer first updates node embeddings and then transforms edge
+    attributes so the next layer can use a learned edge representation.
+    """
     def __init__(self, 
                 node_input_dim, edge_input_dim,
                 node_dim, edge_dim, edge_mode,
@@ -56,7 +69,8 @@ class GNNStack(torch.nn.Module):
                                     node_dim, edge_dim, edge_mode,
                                     model_types, normalize_embs, activation, aggr)
 
-        # post node update
+        # The post MLP keeps the output width at ``node_dim`` unless the
+        # caller explicitly requests another hidden layout.
         if concat_states:
             self.node_post_mlp = self.build_node_post_mlp(int(node_dim*len(model_types)), int(node_dim*len(model_types)), node_post_mlp_hiddens, dropout, activation)
         else:
@@ -65,30 +79,26 @@ class GNNStack(torch.nn.Module):
         self.edge_update_mlps = self.build_edge_update_mlps(node_dim, edge_input_dim, edge_dim, self.gnn_layer_num, activation)
         
 
-        # -------------------------------------------------------------------
-        # ADDED:
+        # ----------------------- M^3-Impute state -----------------------
         self.device = device if device is not None else torch.device('cpu')
         self.EPSILON = EPSILON
         self.number_of_obs_node = number_of_obs_nodes
         self.number_of_feature = node_input_dim
         self.hidden_dim = node_dim
 
-        # Observation and Feature Node embedding Initialization:
+        # Feature-node embeddings are initialized once and reused to derive
+        # the initial sample-node embeddings from the observed-value matrix.
         self.__init_node(node_input_dim, self.hidden_dim)
 
         self.init_obs_mlp = nn.Linear(self.hidden_dim, self.hidden_dim)
         self.init_feature_mlp = nn.Linear(self.hidden_dim, self.hidden_dim)
 
-    # ADDED:
-    # ---------------------------------------------------------------
     def __init_node(self, feature_input_dim, hidden_dim):
-        """
-        This function initialize feature node embeddings
-        """
-        # shape: (number of feature, hidden dim)
+        """Initialize one trainable-width vector per input feature."""
         self.feature_nodes = torch.rand((feature_input_dim, hidden_dim), requires_grad=True, dtype=torch.float32, device=self.device)
 
     def node_init(self, attn_score):
+        """Create ``[sample nodes; feature nodes]`` before message passing."""
         obs_node_embs = attn_score @ self.feature_nodes        # (n_of_sample, n_of_feature) x (n_of_feature, d) => (number of sample, d)
         
         # feed into mlp
@@ -117,6 +127,7 @@ class GNNStack(torch.nn.Module):
     def build_convs(self, node_input_dim, edge_input_dim,
                      node_dim, edge_dim, edge_mode,
                      model_types, normalize_embs, activation, aggr):
+        """Instantiate the requested GNN layers with compatible edge widths."""
         convs = nn.ModuleList()
         conv = self.build_conv_model(model_types[0],node_input_dim,node_dim,
                                     edge_input_dim, edge_mode, normalize_embs[0], activation, aggr)
@@ -128,7 +139,7 @@ class GNNStack(torch.nn.Module):
         return convs
 
     def build_conv_model(self, model_type, node_in_dim, node_out_dim, edge_dim, edge_mode, normalize_emb, activation, aggr):
-        #print(model_type)
+        """Map the short CLI name to a PyG or repository-local layer."""
         if model_type == 'GCN':
             return pyg_nn.GCNConv(node_in_dim,node_out_dim)
         elif model_type == 'GraphSage':
@@ -141,6 +152,7 @@ class GNNStack(torch.nn.Module):
             return EGraphSage(node_in_dim,node_out_dim,edge_dim,activation,edge_mode,normalize_emb, aggr)
 
     def build_edge_update_mlps(self, node_dim, edge_input_dim, edge_dim, gnn_layer_num, activation):
+        """Build one edge-attribute projection for every GNN layer."""
         edge_update_mlps = nn.ModuleList()
         edge_update_mlp = nn.Sequential(
                 nn.Linear(node_dim+node_dim+edge_input_dim,edge_dim),
@@ -156,18 +168,21 @@ class GNNStack(torch.nn.Module):
         return edge_update_mlps
 
     def update_edge_attr(self, x, edge_attr, edge_index, mlp):
+        """Update each edge from its two endpoint embeddings and old attribute."""
         x_i = x[edge_index[0],:]
         x_j = x[edge_index[1],:]
         edge_attr = mlp(torch.cat((x_i,x_j,edge_attr),dim=-1))
         return edge_attr
 
     def forward(self, x, edge_attr, edge_index, train_attr_value):
-        # feature node & sample node init:
+        """Encode a masked matrix and the currently visible graph edges."""
+        # ``train_attr_value`` contains observed values and epsilon markers at
+        # hidden positions.  It is the mask-aware initialization signal.
         x = self.node_init(train_attr_value) # (Number of Node, Hidden Dim)
 
         concat_x = []
         for l,(conv_name,conv) in enumerate(zip(self.model_types,self.convs)):
-            # self.check_input(x,edge_attr,edge_index)
+            # Standard PyG layers ignore edge_attr; EGCN/EGSAGE consume it.
             if conv_name == 'EGCN' or conv_name == 'EGSAGE':
                 x = conv(x, edge_attr, edge_index)
             else:
@@ -176,7 +191,8 @@ class GNNStack(torch.nn.Module):
             concat_x.append(x)
             edge_attr = self.update_edge_attr(x, edge_attr, edge_index, self.edge_update_mlps[l])
 
-        # Added:
+        # Return the final node representation.  The first N rows are sample
+        # nodes and the remaining rows are feature nodes.
         x = self.node_post_mlp(x)
 
         return x
@@ -213,5 +229,4 @@ class GNNStack(torch.nn.Module):
             plt.title('x_j')
         plt.legend()
         plt.show()
-
 

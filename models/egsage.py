@@ -1,3 +1,5 @@
+"""Edge-aware GraphSAGE message-passing layer."""
+
 import torch
 from torch.nn import Parameter
 from torch_scatter import scatter_add
@@ -11,7 +13,7 @@ import torch.nn.functional as F
 from utils.utils import get_activation
 
 class EGraphSage(MessagePassing):
-    """Non-minibatch version of GraphSage."""
+    """Non-minibatch GraphSAGE with several edge-feature message modes."""
     def __init__(self, in_channels, out_channels,
                  edge_channels, activation, edge_mode,
                  normalize_emb,
@@ -48,6 +50,7 @@ class EGraphSage(MessagePassing):
         self.normalize_emb = normalize_emb
 
     def forward(self, x, edge_attr, edge_index):
+        """Aggregate messages for all nodes in the current full graph."""
         num_nodes = x.size(0)
         # x has shape [N, in_channels]
         # edge_index has shape [2, E]
