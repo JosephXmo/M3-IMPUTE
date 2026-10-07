@@ -85,6 +85,24 @@ uci/raw_data/my_dataset/
 
 仓库中已有的一些数据集还包含 `index_target.txt`、`index_features.txt` 或 `split_data_train_test.py`。当前 `load_data()` 的训练主路径只读取 `data/data.txt`，这些辅助文件不是新数据集接入的必需项。
 
+### mHealth 数据集
+
+`mhealth/original` 包含 10 位受试者的 50 Hz 原始传感器记录。从仓库根目录分别生成两种特征表：
+
+```bash
+python mhealth/preprocess.py --mode full
+python mhealth/preprocess.py --mode acc_gyro_only
+python train_mdi.py --epochs 1 --log_dir mhealth_smoke mhealth --data mhealth --train_edge 0.7
+```
+
+`full` 写入 `uci/raw_data/mhealth/data`，`acc_gyro_only` 写入 `uci/raw_data/mhealth_acc_gyro_only/data`。两种模式共享 253 维加速度/陀螺仪特征：身体与重力加速度分离、连续信号求 jerk、向量模长、均值/标准差/中位绝对偏差/四分位距/能量/自相关、FFT 主频与频谱量、重力方向角，以及轴间和部位间相关性。全传感器模式再加入磁场单位方向、对数场强及其变化特征，以及 ECG 基本统计，共 295 维；磁场强度取对数以降低受试者间的尺度差异。短窗 ECG 不计算心率或 HRV。`acc_gyro_only` 仅对齐 UCI-HAR 的传感器类型和部分特征方法；mHealth 佩戴部位不同。具体列名及顺序保存在 `feature_names.txt`；这些列与 UCI-HAR 官方 561 列不等价，不能直接复用依赖其定义的权重。
+
+窗口在每位受试者的原始时间轴上固定取 128 点（2.56 秒），步长 64 点（50% 重叠），**不使用标签确定窗口边界**。滤波在完整受试者序列上进行：加速度/陀螺仪先用 20 Hz 零相位 FIR 去噪，加速度再经 0.3 Hz 零相位 FIR 分离重力；输入单位转换为 `g` 与 `rad/s`。这是离线预处理，零相位滤波使用窗口后续的信号，不能直接作为实时推理流程。
+
+`data.txt` **只含特征**，对应的活动标签按相同行序保存在 `labels.txt`；仅保留标签 1-12 且窗口内标签完全一致的样本，标签 0 是未标注区间。`windows.csv` 记录**全部候选窗口**的起止采样点、多数标签、纯度和筛选决定，便于报告筛选覆盖率或改变 `--min-purity` 后重新生成。`manifest.json` 保存双文件格式、参数和原始文件 SHA-256；`subject_ids.txt` 与 10 组 `index_train_<fold>.txt` / `index_test_<fold>.txt` 构成留一受试者划分，fold 0-9 分别留出受试者 1-10。活动标签和受试者编号都不进入特征矩阵。
+
+`labels.txt` 仅供 XHAR-SDCN 等下游任务计算指标使用。`train_mdi.py mhealth` 只读取纯特征的 `data.txt`，不加载活动标签；M3 的 `train_labels` 是被遮挡单元格的特征值。原有 `train_mdi.py uci` 路径保持不变。上述命令是单元格补全训练的冒烟示例；跨受试者实验还需在训练折拟合缩放器、训练模型，并只对留出的受试者评估。特征单元格随机缺失也不同于原始时间点或整路传感器缺失，两种缺失协议应分别报告。
+
 ### UCI-HAR 数据集
 
 仓库中的 `uci/raw_data/har/original` 是 UCI-HAR 原始目录。可以使用预处理脚本合并官方 train/test 文件，并按指定比例生成缺失单元：

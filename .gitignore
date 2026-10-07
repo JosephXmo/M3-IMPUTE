@@ -1,9 +1,11 @@
 __pycache__
 .ipynb_checkpoints
 .dropbox
+.vscode
 Icon?
 *.DS_Store
 test
 uci/results
 legacy
 uci/raw_data/har/original
+mhealth/original

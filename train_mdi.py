@@ -16,6 +16,7 @@ import torch
 
 from training.gnn_mdi import train_gnn_mdi
 from uci.uci_subparser import add_uci_subparser
+from mhealth.mhealth_data import add_mhealth_subparser
 
 def main():
     parser = argparse.ArgumentParser()
@@ -83,6 +84,7 @@ def main():
     
     subparsers = parser.add_subparsers()
     add_uci_subparser(subparsers)
+    add_mhealth_subparser(subparsers)
     args = parser.parse_args()
     print(args)
     print('--'*20)
@@ -109,6 +111,9 @@ def main():
     # --------------------------- Dataset setup ------------------------
     if args.domain == 'uci':
         from uci.uci_data import load_data
+        data = load_data(args)
+    elif args.domain == 'mhealth':
+        from mhealth.mhealth_data import load_data
         data = load_data(args)
     else:
         raise Exception('Unsupported datasets.')
