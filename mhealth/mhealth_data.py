@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 
 
-DATA_ROOT = Path(__file__).resolve().parent.parent / "uci" / "raw_data"
+DATA_ROOT = Path(__file__).resolve().parent / "raw_data"
 DATASETS = ("mhealth", "mhealth_acc_gyro_only")
 
 

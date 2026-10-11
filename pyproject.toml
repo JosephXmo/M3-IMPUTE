@@ -1,0 +1,22 @@
+[project]
+name = "m3-impute"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Joseph Phantom", email = "qhdqsb@hotmail.com" },
+    { name = "Zhongyi Yu", email = "zhongyicst@gmail.com"}
+]
+requires-python = ">=3.11.15"
+dependencies = [
+    "fancyimpute>=0.7.0",
+    "hyperimpute>=0.1.17",
+    "matplotlib>=3.11.2",
+    "numpy<2",
+    "pyqt5>=5.15.11",
+    "scipy>=1.17.1",
+    "seaborn>=0.13.2",
+    "torch==2.1.0",
+    "torch-geometric>=2.8.0.post1",
+    "torchvision==0.16.0",
+]
