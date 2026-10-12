@@ -8,5 +8,8 @@ test
 uci/results
 legacy
 uci/raw_data/har/original
+uci/raw_data/har/data
+uci/raw_data/har_cross_train/data
+!uci/raw_data/har/data/split_data_train_test.py
 mhealth/original
 uv.lock

@@ -105,6 +105,8 @@ python train_mdi.py --epochs 1 --log_dir mhealth_smoke mhealth --data mhealth --
 
 ### UCI-HAR 数据集
 
+被试分离的 M3 → XHAR 四组对照（S₀、均值占位、相似度插值、M3 补全）使用独立流水线，详见 [中文实验指南](uci/raw_data/har/CROSS_COMPARISON_GUIDE.md)。该流程使用训练集统计量，并保持四组下游输入尺寸一致。
+
 仓库中的 `uci/raw_data/har/original` 是 UCI-HAR 原始目录。可以使用预处理脚本合并官方 train/test 文件，并按指定比例生成缺失单元：
 
 ```bash
