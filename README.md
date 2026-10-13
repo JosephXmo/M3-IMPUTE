@@ -6,19 +6,20 @@
 train_mdi.py                 命令行入口、随机种子、设备和输出目录
 uci/uci_data.py              读取 data.txt，归一化并构造二部图
 training/gnn_mdi.py          训练、验证、测试和结果保存
+training/imputation_batches.py  分块预测、损失累积与编码器梯度回传
 models/gnn_model.py          GNNStack 图编码器
 models/egsage.py             边感知 GraphSAGE 层
 models/egcn.py               边感知 GCN 层
 models/prediction_model.py   FCU、SRU 和 ImputeNet 预测头
 ```
 
-本次整理只增加说明性注释，并保留了原有目录、类名和训练调用方式。为了兼容仓库中已有的实验脚本，`--impute_hidden` 现在是 `--impute_hiddens` 的别名；两个参数写入同一个配置项。
+保留原有目录、类名和训练调用方式，并添加说明性注释。训练和评估的预测头现在按目标单元格分块，以限制 FCU/SRU 中间张量的显存；图编码仍采用全图方式。为了兼容仓库中已有的实验脚本，`--impute_hidden` 是 `--impute_hiddens` 的别名；两个参数写入同一个配置项。
 
 ![M3-Impute 模型结构](assets/m3-model.png)
 
 ## 1. 安装环境
 
-代码依赖 PyTorch、PyTorch Geometric、`torch-scatter`、NumPy、SciPy、scikit-learn、pandas、matplotlib、seaborn 和 `fancyimpute`。仓库提供了基础依赖列表：
+M3 训练依赖 PyTorch、PyTorch Geometric、NumPy、SciPy、scikit-learn、pandas 和 matplotlib。基线及其他工具另外使用 `fancyimpute` 等库；仓库提供了综合依赖列表：
 
 ```bash
 python -m venv .venv
@@ -27,7 +28,7 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-`torch-scatter` 必须与 PyTorch 和 CUDA 版本匹配。先确认版本：
+核心训练不再直接依赖 `torch-scatter`：EGCN 的度数求和使用 PyG 的 `scatter(..., reduce='sum')`，EGSAGE 不需要导入该扩展。PyG 的这些求和路径可使用 PyTorch 原生算子；因此可以先只安装与 GPU 架构兼容的 PyTorch 和 PyG，避免被旧扩展 wheel 限制。先确认版本：
 
 ```bash
 python - <<'PY'
@@ -38,22 +39,22 @@ print('available:', torch.cuda.is_available())
 PY
 ```
 
-例如，PyTorch 2.1.0 + CUDA 12.1 可以使用：
+如果其他工具需要 `torch-scatter`，其 wheel 必须同时匹配 PyTorch、CUDA 和 GPU 架构。例如，旧环境 PyTorch 2.1.0 + CUDA 12.1 对应如下页面（这不是 RTX PRO 6000 Blackwell 的安装推荐）：
 
 ```bash
 python -m pip install torch-scatter \
   -f https://data.pyg.org/whl/torch-2.1.0+cu121.html
 ```
 
-CPU 环境则使用对应的 `+cpu` 页面。不要只根据操作系统选择链接；`torch-scatter` 的 wheel 需要同时匹配 PyTorch 主版本和 CUDA 版本。安装后可以快速检查：
+CPU 扩展使用对应的 `+cpu` 页面。核心依赖安装后可以快速检查，不需要导入可选扩展：
 
 ```bash
 python - <<'PY'
 import torch
 import torch_geometric
-from torch_scatter import scatter
 print(torch.__version__, torch_geometric.__version__)
-print('torch-scatter: ok')
+from models.gnn_model import GNNStack
+print('M3 core imports: ok')
 PY
 ```
 
@@ -288,11 +289,13 @@ MAR/MNAR 的控制参数是 `--mar_rate_obs`、`--mar_rate_missing` 和 `--mnar_
 
 ### 模型与资源
 
-`--model_types EGSAGE_EGSAGE_EGSAGE` 用下划线分隔 GNN 层，可以替换为仓库支持的层类型组合。`--node_dim` 和 `--edge_dim` 控制节点/边隐空间宽度；数据较大或显存不足时优先降低它们。
+`--model_types EGSAGE_EGSAGE_EGSAGE` 用下划线分隔 GNN 层，可以替换为仓库支持的层类型组合。`--node_dim` 和 `--edge_dim` 控制节点/边隐空间宽度。它们不能控制 FCU/SRU 沿完整输入特征列展开的张量大小。
+
+`--impute_batch_size` 控制预测头每批的目标单元格数，默认 `1024`，训练、验证及单元格测试均使用它。例如 `python train_mdi.py --impute_batch_size 512 --apply_attr --apply_peer --save_model uci --data har`。每轮只编码一次训练图，逐批计算损失并立即反向，最后将累积的节点表示梯度回传给 GNN，再执行一次优化器更新。损失按该轮全部训练目标数归一化，最后不足一批的部分也有正确权重；`loss_mode=1` 仍保留原有的全部训练目标数分母。减少 batch 不会删除输入列或训练样本，但通常增加运行时间。
 
 `--apply_attr` 和 `--apply_peer` 分别打开 FCU 和 SRU。SRU 的 `--sample_peer_size` 越大，采样上下文越多但计算和显存开销越高。`--sample_strategy random_sample` 不需要相似度缓存；`cos-similarity` 会按 `--update_cos_sample_prob_every` 个 epoch 更新采样概率。
 
-当样本数很大时，`--very_large_dataset` 会让 SRU 使用较小的候选空间，大小由 `--sample_space_size` 控制，以避免维护完整的样本两两相似度表。
+当样本数很大且采用 `cos-similarity` 时，`--very_large_dataset` 会让 SRU 使用较小的候选空间，大小由 `--sample_space_size` 控制，以避免维护完整的样本两两相似度表。它不限制 FCU/SRU 的每批目标数，对默认随机 peer 策略没有这一节省作用。
 
 `--init_epsilon` 是输入矩阵中隐藏单元的占位值。它和 `Known_Mask` 配合使用，用于区分“真实观测值为 0”和“当前不可见”。通常保留默认的 `1e-4`。
 
@@ -417,18 +420,21 @@ python downstream_task.py --method m3-impute
 
 **CUDA 设备错误**：显式指定有效的 `--gpu`，或在无 CUDA 环境中删除该参数。程序会在 CUDA 不可用时使用 CPU。
 
-**运行很慢或显存不足**：降低 `node_dim`、`edge_dim`、`sample_peer_size`；大数据集使用 `--very_large_dataset`。完整图的边数约为 `2 × N × M`，样本数和特征数同时增大时内存会迅速上升。
+**运行很慢或显存不足**：FCU/SRU 报 OOM 时先降低 `--impute_batch_size`，例如 `1024 → 512 → 256`；GNN 编码报 OOM 时降低 `node_dim`、`edge_dim`。`sample_peer_size` 也影响 SRU 的每批开销；大数据集采用 cosine peer 时可使用 `--very_large_dataset`。完整图的边数约为 `2 × N × M`，预测头分块不能消除全图编码显存。
 
 **实验脚本参数报错**：仓库脚本中的旧参数名 `--impute_hidden` 已由入口兼容；如果自定义脚本使用其它未声明参数，请以 `train_mdi.py` 和 `uci/uci_subparser.py` 中的 parser 定义为准。
 
 ## 9. 当前实现边界
 
-本次整理保持了原有计算语义。以下行为是当前实现的既有设计，后续若要改变需要单独验证：
+训练分块保留每轮一次优化器更新和原损失归一化方式，并修复了以下实现问题：
 
-1. `GNNStack.feature_nodes` 目前以普通 Tensor 保存，虽然设置了 `requires_grad=True`，但没有注册为 `nn.Parameter`；它不会像标准模块参数那样自动出现在 `model.parameters()` 中。
-2. `concat_states` 分支保留了原有接口；当前 forward 会收集中间状态，但没有额外改变最终返回张量的拼接语义。
-3. 评估指标默认在归一化特征值空间计算，不能直接当作原始单位的 RMSE。
-4. 代码使用整张样本-特征图，超大数据集需要从节点维度、SRU 候选空间和数据切分三个方向共同控制资源。
+1. `GNNStack.feature_nodes` 注册为 `nn.Parameter`，现在参与优化、`state_dict()` 和设备迁移。旧版本的完整模块 checkpoint 加载时会把普通 Tensor 注册为参数，并保留数值；新训练会更新这些向量，与旧实现的训练结果可能不同。
+2. 图上下文保留双向边，但训练、评估和补全只预测每个目标单元格一次，避免曾经没有进入损失的反向重复预测。最后一层无人使用的边更新不再执行，模块仍保留以兼容 checkpoint。
+3. cosine peer 概率缓存不保留计算图；更新时使用已定义的观测矩阵，并处理负权重或正候选不足的情况。无验证集时不会访问不存在的最佳验证轮次。
+
+固定 peer、关闭 dropout 时，新旧预测、损失及编码器/预测头梯度的数值一致性已有回归测试。随机 peer 和 dropout 的随机数调用顺序会随分块大小改变，因此同 seed 的不同 batch 配置不保证逐位相同。完整模型训练测试覆盖 12/10、561 列、随机 peer、无验证集，以及另一组带验证和 cosine 缓存更新的配置；这些是小规模 CPU 测试，不是全量 HAR 的 CUDA 验收。
+
+`concat_states` 保留原接口，当前 forward 未拼接中间状态；评估指标默认仍在归一化特征空间。图编码仍是全图方式，超大数据集需要继续控制编码器宽度及图规模。
 
 ## License
 

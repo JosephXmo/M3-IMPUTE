@@ -205,6 +205,7 @@ class Similariy_Net(nn.Module):
 
         self.sample_space = torch.randint(0, self.num_record, (self.sample_space_size, )).to(self.device)      # (K,), K = sample space size
 
+    @torch.no_grad()
     def update_cos_prob(self, feature_node_embs, attn_score):
         """Refresh the peer-sampling table from current feature embeddings.
 
@@ -244,6 +245,16 @@ class Similariy_Net(nn.Module):
             self.sample_prob = F.cosine_similarity(lf, rt, dim=2)                                # cos shape: (N, N)
             self.sample_prob = self.sample_prob.fill_diagonal_(0)                                # mask out similarity with self
 
+        # Sampling probabilities are a cache, not a differentiable model path.
+        # Learned feature vectors can produce negative cosine values. Fall back
+        # to uniform candidates if multinomial cannot choose enough peers.
+        self.sample_prob.clamp_(min=0)
+        insufficient = (self.sample_prob > 0).sum(1) < self.sample_peer_size
+        self.sample_prob[insufficient] = 1
+        if not self.running_on_large_dataset:
+            self.sample_prob.fill_diagonal_(0)
+        if bool(((self.sample_prob > 0).sum(1) < self.sample_peer_size).any()):
+            raise ValueError("sample_peer_size exceeds the available cosine candidates")
         # free GPU memory:
         del lf, rt
         torch.cuda.empty_cache()
@@ -383,21 +394,17 @@ class ImputeNet(nn.Module):
         ).to(self.device)
     
     def get_imp_obs_fea_pair_index(self, impute_target):
-        """Convert duplicated directed target edges to sample/feature indices.
+        """Map each supplied edge to a sample-feature pair in the same order.
 
-        The data loader stores sample-to-feature edges first and their reverse
-        copies second.  The first edge whose source is a feature node marks the
-        boundary between these two halves.
+        Legacy callers may supply both directions. Batched train/eval callers
+        supply only sample->feature edges so each cell is predicted once.
         """
         end1, end2 = impute_target
-        idx  = torch.ge(end1, self.num_record)
-        idx = torch.nonzero(idx).squeeze(dim=1)[0].item()
-
-        obs_idx                    = torch.cat((end1[:idx], end2[idx:]), dim=0).to(self.device)
+        forward = end1 < self.num_record
+        obs_idx = torch.where(forward, end1, end2).to(self.device)
         attr_idx_need_to_be_impute = (
-            torch.cat((end2[:idx], end1[idx:]), dim=0) - self.num_record
+            torch.where(forward, end2, end1) - self.num_record
         ).to(self.device)
-
         return obs_idx, attr_idx_need_to_be_impute
 
     def sim_confidence(self, similarity):

@@ -51,6 +51,8 @@ def main():
     parser.add_argument('--masking_distribution', type=str, default='uniform')
     parser.add_argument('--auto_known', action='store_true', default=False)
     parser.add_argument('--loss_mode', type=int, default=0)  # 0: all train cells; 1: hidden train cells only
+    parser.add_argument('--impute_batch_size', type=int, default=1024,
+                        help='unique feature-cell targets per decoder batch; encoder remains full-graph')
     parser.add_argument('--valid', type=float, default=0.)  # validation ratio among training cells
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--log_dir', type=str, default='0')
@@ -86,6 +88,8 @@ def main():
     add_uci_subparser(subparsers)
     add_mhealth_subparser(subparsers)
     args = parser.parse_args()
+    if args.impute_batch_size < 1:
+        parser.error('--impute_batch_size must be positive')
     print(args)
     print('--'*20)
     print(f'[Config] Missing Pattern: {args.corrupt}')

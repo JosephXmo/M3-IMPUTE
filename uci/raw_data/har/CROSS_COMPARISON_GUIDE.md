@@ -1,7 +1,7 @@
 # UCI-HAR：被试分离的 M3 → XHAR 四组对照
 
 这条独立流水线使用 UCI-HAR 官方 561 维特征，不再导出 M3 的节点 representation。
-所有数据适配都位于 `preprocess_cross_comparison.py`，沿用现有 M3 训练器、图编码器和 ImputeNet。
+所有数据适配都位于 `preprocess_cross_comparison.py`，沿用现有 M3 训练入口、图编码器和 ImputeNet；训练器已修复预测头整批展开导致的显存问题。
 M3-XHAR 联合训练不在此流程内。
 
 ## 1. 执行命令
@@ -26,7 +26,8 @@ python uci/raw_data/har/preprocess_cross_comparison.py prepare \
 ```bash
 python uci/raw_data/har/preprocess_cross_comparison.py train \
   --node-dim 64 --edge-dim 64 --epochs 200 --gpu 0 \
-  --apply-attr --apply-peer --log-dir cross_64_64_seed42
+  --apply-attr --apply-peer --impute-batch-size 1024 \
+  --log-dir cross_64_64_seed42
 ```
 
 ### 32/16 训练并保存权重，降低表示宽度以节约显存
@@ -34,14 +35,28 @@ python uci/raw_data/har/preprocess_cross_comparison.py train \
 ```bash
 python uci/raw_data/har/preprocess_cross_comparison.py train \
   --node-dim 32 --edge-dim 16 --epochs 200 --gpu 0 \
-  --apply-attr --apply-peer --log-dir cross_32_16_seed42
+  --apply-attr --apply-peer --impute-batch-size 1024 \
+  --log-dir cross_32_16_seed42
 ```
 
 两条命令都会训练 **全部 S_train 样本和全部 561 个输入特征**。
 减小的是 GNN 节点/边表示宽度及预测头隐藏宽度，不是删除特征列或减少样本。
 `--apply-attr` 开启 FCU，`--apply-peer` 开启 SRU，默认采用随机 peer。
 这两项与原训练入口一样均为可选；删除它们会训练没有相应上下文模块的消融版本，不能和完整模块版本混称。
-降低表示宽度不保证解决所有 OOM，尤其 FCU/SRU 的中间张量仍与目标单元格数和 561 维输入相关；原训练器仍是全图训练，没有新增 batch-size 支持。
+`--impute-batch-size` 控制每批预测的目标单元格数，默认 `1024`；若 FCU/SRU 仍报 OOM，可降到 `512` 或 `256`。训练器每轮只编码一次图，预测头逐批算损失并立即反向，累积节点表示梯度后统一回传给图编码器，每轮仍只更新一次参数。验证和测试预测也分块；不会在最后拼接所有带梯度的预测而保留整轮中间张量。
+
+例如，重跑 12/10 配置：
+
+```bash
+python uci/raw_data/har/preprocess_cross_comparison.py train \
+  --node-dim 12 --edge-dim 10 --epochs 200 --gpu 0 \
+  --apply-attr --apply-peer --impute-batch-size 1024 \
+  --log-dir cross_12_10_seed42_batched
+```
+
+过去 6969 × 561 的训练图会一次预测约 547 万条双向目标边，单个 FCU `[目标数, 561]` 浮点张量就约 11.44 GiB，宽度降到 12/10 也不会缩小这两个维度。现在只预测约 274 万个唯一单元格并分块；batch 为 1024、peer 为 5 时，单个 SRU `[1024, 5, 1122]` 拼接张量约 21.9 MiB。这只是一个张量的大小，不是整个训练进程的显存估计。图编码仍为全图，降低表示宽度仍可减少它的显存需求。
+
+`feature_nodes` 同时修复为可训练参数；旧完整模块权重加载时保留其向量数值。新训练结果可能与旧实现不同。不同 batch 大小会改变 peer/dropout 的随机数顺序，不能期望相同 seed 的训练逐位一致。
 
 `--epochs 200` 是便于启动的显式预算，不表示已经证明收敛。可按事先确定的预算调节，但不应依靠 S₀ 或 XHAR 指标选择 M3 checkpoint。
 训练包装器自动传入 `--save_model --valid 0 --seed 42`；其中 seed 从准备阶段的 manifest 读取。
@@ -174,4 +189,4 @@ python train.py -C experiments/har_missing_10rows_102cols/hhar_m3.yaml
 
 补全后 manifest 会记录隐藏单元格的 MAE/RMSE（原始特征单位），另行比较 XHAR 的 ACC/NMI/ARI 等下游指标。
 局部测试可以执行 `PYTHONPATH=uci/raw_data/har:. python -m unittest uci/raw_data/har/test_cross_comparison.py -v`；
-这些测试覆盖划分、训练统计量、遮挡真值隔离、插值方向及真实 ImputeNet 的新样本数量适配，不能替代完整 GNN 训练验收。
+这些测试覆盖划分、训练统计量、遮挡真值隔离、插值方向及真实 ImputeNet 的新样本数量适配。分块训练回归测试另用 `python -m unittest training.test_imputation_batches -v`，覆盖预测/损失/梯度一致性、单次编码器反向、旧权重加载和小规模真实 GNN 训练保存补全；这些 CPU 检查不能替代全量 HAR 的目标 GPU 验收。

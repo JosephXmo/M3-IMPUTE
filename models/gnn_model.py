@@ -95,7 +95,16 @@ class GNNStack(torch.nn.Module):
 
     def __init_node(self, feature_input_dim, hidden_dim):
         """Initialize one trainable-width vector per input feature."""
-        self.feature_nodes = torch.rand((feature_input_dim, hidden_dim), requires_grad=True, dtype=torch.float32, device=self.device)
+        self.feature_nodes = nn.Parameter(torch.rand(
+            (feature_input_dim, hidden_dim), dtype=torch.float32, device=self.device))
+
+    def __setstate__(self, state):
+        """Promote legacy full-module Tensor checkpoints without changing values."""
+        super().__setstate__(state)
+        if "feature_nodes" in self.__dict__:
+            features = self.__dict__.pop("feature_nodes")
+            self.register_parameter("feature_nodes", nn.Parameter(
+                features.detach(), requires_grad=features.requires_grad))
 
     def node_init(self, attn_score):
         """Create ``[sample nodes; feature nodes]`` before message passing."""
@@ -189,7 +198,10 @@ class GNNStack(torch.nn.Module):
                 x = conv(x, edge_index)
             
             concat_x.append(x)
-            edge_attr = self.update_edge_attr(x, edge_attr, edge_index, self.edge_update_mlps[l])
+            # The final updated edges have no consumer; retain its module for
+            # checkpoint compatibility, but avoid allocating unused activations.
+            if l + 1 < self.gnn_layer_num:
+                edge_attr = self.update_edge_attr(x, edge_attr, edge_index, self.edge_update_mlps[l])
 
         # Return the final node representation.  The first N rows are sample
         # nodes and the remaining rows are feature nodes.

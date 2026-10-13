@@ -15,8 +15,7 @@ from models.gnn_model import get_gnn
 from models.prediction_model import ImputeNet
 from utils.plot_utils import plot_curve, plot_sample
 from utils.utils import build_optimizer, objectview, get_known_mask, mask_edge
-import seaborn as sns
-import matplotlib.pyplot as plt
+from training.imputation_batches import train_imputation_batches, predict_imputation_batches
 
 def get_known_A_during_training(A, Known_Mask, train_removed_edges, tgt_v, n_of_record=None, device=None, epsilon=1e-4):
     """Apply the current step's hidden-edge mask to ``A`` and ``Known_Mask``."""
@@ -76,6 +75,10 @@ def train_gnn_mdi(data, args, log_path, run_iter_num, device=torch.device('cpu')
     # from the currently visible graph, and ImputeNet predicts hidden cells from
     # those embeddings plus the visibility mask.
     model = get_gnn(data, args, device).to(device)
+    impute_batch_size = getattr(args, 'impute_batch_size', 1024)
+    if impute_batch_size < 1:
+        raise ValueError('impute_batch_size must be positive')
+    ce_loss = getattr(args, 'ce_loss', False)
     if args.impute_hiddens == '':
         impute_hiddens = []
     else:
@@ -129,7 +132,7 @@ def train_gnn_mdi(data, args, log_path, run_iter_num, device=torch.device('cpu')
         test_edge_attr = data.test_edge_attr.clone().detach().to(device)
         test_labels = data.test_labels.clone().detach().to(device)
     if hasattr(data,'class_values'):
-        class_values = data.class_values.clone().detach().to(device)
+        class_values = data.class_values.detach().cpu()
     # Validation removes a fixed subset of train cells from the input graph;
     # their labels remain available only for model selection.
     if args.valid > 0.:
@@ -205,7 +208,7 @@ def train_gnn_mdi(data, args, log_path, run_iter_num, device=torch.device('cpu')
         # periodically.  Random sampling does not need this cache.
         if args.apply_peer == True and args.sample_strategy == 'cos-similarity' and (epoch + 1) % args.update_cos_sample_prob_every == 0:
             print('[SRU] Update Sample Space')
-            impute_model.SRU.update_cos_prob(model.feature_nodes, Train_A)
+            impute_model.SRU.update_cos_prob(model.feature_nodes, A)
 
         # Hide a fresh subset of observed cells for self-supervision.  The
         # hidden labels are still used as reconstruction targets below.
@@ -223,24 +226,15 @@ def train_gnn_mdi(data, args, log_path, run_iter_num, device=torch.device('cpu')
         # Encode the masked bipartite graph.
         x_embd = model(x, known_edge_attr, known_edge_index, Train_A)    # Input shape: (#Obs + #Fea, #feature)
         
-        # Predict the target edges with the optional FCU and SRU context units.
-        pred, _ = impute_model(obs_nodes_embs=x_embd[: num_record], fea_nodes_embs=x_embd[num_record:], known_edges=known_edge_index, impute_target_edges=train_edge_index, known_mask=Train_Known_mask)
-
-        if hasattr(args,'ce_loss') and args.ce_loss:
-            pred_train = pred[:int(train_edge_attr.shape[0] / 2)]
-        else:
-            pred_train = pred[:int(train_edge_attr.shape[0] / 2),0]
-        if args.loss_mode == 1:
-            pred_train[known_mask] = train_labels[known_mask]
+        # Each decoder batch frees its activations after backward. The helper
+        # accumulates the encoder-output gradient and backpropagates GNN once.
+        pred_train, train_loss = train_imputation_batches(
+            x_embd, impute_model, known_edge_index, train_edge_index,
+            Train_Known_mask, train_labels, num_record, impute_batch_size,
+            known_targets=known_mask, loss_mode=args.loss_mode, ce_loss=ce_loss)
         label_train = train_labels
-
-        if hasattr(args,'ce_loss') and args.ce_loss:
-            loss = F.cross_entropy(pred_train, train_labels)
-        else:
-            loss = F.mse_loss(pred_train, label_train)
-        loss.backward()
         opt.step()
-        train_loss = loss.item()
+        del x_embd
         if scheduler is not None:
             scheduler.step(epoch)
         for param_group in opt.param_groups:
@@ -254,19 +248,23 @@ def train_gnn_mdi(data, args, log_path, run_iter_num, device=torch.device('cpu')
                 # Validation uses all ordinary training edges as context and
                 # evaluates only the held-out validation labels.
                 x_embd = model(x, train_edge_attr, train_edge_index, A)
-                pred, _ = impute_model(obs_nodes_embs=x_embd[: num_record], fea_nodes_embs=x_embd[num_record:],known_edges=train_edge_index, impute_target_edges=valid_edge_index, known_mask=Known_Mask)
+                pred = predict_imputation_batches(
+                    x_embd, impute_model, train_edge_index, valid_edge_index,
+                    Known_Mask, num_record, impute_batch_size)
+                del x_embd
+                valid_labels_cpu = valid_labels.detach().cpu()
                 
                 if hasattr(args,'ce_loss') and args.ce_loss:
-                    pred_valid = class_values[pred[:int(valid_edge_attr.shape[0] / 2)].max(1)[1]]
-                    label_valid = class_values[valid_labels]
+                    pred_valid = class_values[pred.max(1)[1]]
+                    label_valid = class_values[valid_labels_cpu]
                 elif hasattr(args,'norm_label') and args.norm_label:
-                    pred_valid = pred[:int(valid_edge_attr.shape[0] / 2),0]
+                    pred_valid = pred[:,0]
                     pred_valid = pred_valid * max(class_values)
-                    label_valid = valid_labels
+                    label_valid = valid_labels_cpu
                     label_valid = label_valid * max(class_values)
                 else:
-                    pred_valid = pred[:int(valid_edge_attr.shape[0] / 2),0]
-                    label_valid = valid_labels
+                    pred_valid = pred[:,0]
+                    label_valid = valid_labels_cpu
                 mse = F.mse_loss(pred_valid, label_valid)
                 valid_rmse = np.sqrt(mse.item())
                 l1 = F.l1_loss(pred_valid, label_valid)
@@ -291,26 +289,30 @@ def train_gnn_mdi(data, args, log_path, run_iter_num, device=torch.device('cpu')
             # unless the optional classification/label-normalization branches
             # are enabled by the caller.
             x_embd = model(x, test_input_edge_attr, test_input_edge_index, A)
-            pred, _ = impute_model(obs_nodes_embs=x_embd[: num_record], fea_nodes_embs=x_embd[num_record:],known_edges=test_input_edge_index, impute_target_edges=test_edge_index, known_mask=Known_Mask)
+            pred = predict_imputation_batches(
+                x_embd, impute_model, test_input_edge_index, test_edge_index,
+                Known_Mask, num_record, impute_batch_size)
+            del x_embd
+            test_labels_cpu = test_labels.detach().cpu()
 
             
             if hasattr(args,'ce_loss') and args.ce_loss:
-                pred_test = class_values[pred[:int(test_edge_attr.shape[0] / 2)].max(1)[1]]
-                label_test = class_values[test_labels]
+                pred_test = class_values[pred.max(1)[1]]
+                label_test = class_values[test_labels_cpu]
             elif hasattr(args,'norm_label') and args.norm_label:
-                pred_test = pred[:int(test_edge_attr.shape[0] / 2),0]
+                pred_test = pred[:,0]
                 pred_test = pred_test * max(class_values)
-                label_test = test_labels
+                label_test = test_labels_cpu
                 label_test = label_test * max(class_values)
             else:
-                pred_test = pred[:int(test_edge_attr.shape[0] / 2),0]
-                label_test = test_labels
+                pred_test = pred[:,0]
+                label_test = test_labels_cpu
                 
             mse = F.mse_loss(pred_test, label_test)
             test_rmse = np.sqrt(mse.item())
             l1 = F.l1_loss(pred_test, label_test)
             test_l1 = l1.item()
-            if args.save_prediction:
+            if args.save_prediction and args.valid > 0.:
                 if epoch == best_valid_rmse_epoch:
                     obj['outputs']['best_valid_rmse_pred_test'] = pred_test.detach().cpu().numpy()
                 if epoch == best_valid_l1_epoch:
@@ -352,7 +354,8 @@ def train_gnn_mdi(data, args, log_path, run_iter_num, device=torch.device('cpu')
     obj['outputs']['label_train'] = label_train
     obj['outputs']['final_pred_test'] = pred_test
     obj['outputs']['label_test'] = label_test
-    pickle.dump(obj, open(log_path + 'result.pkl', "wb"))
+    with open(log_path + 'result.pkl', "wb") as handle:
+        pickle.dump(obj, handle)
 
     if args.save_model:
         torch.save(model, log_path + 'model.pt')

@@ -140,8 +140,11 @@ def build_target_edges(
     cols: np.ndarray,
     num_records: int,
     device: torch.device,
+    bidirectional: bool = True,
 ) -> torch.Tensor:
-    """Build forward-then-reverse target edges expected by ``ImputeNet``."""
+    """Build target edges; decoder batching needs only the forward direction."""
+    if not bidirectional:
+        return torch.from_numpy(np.stack((rows, num_records + cols)).astype(np.int64)).to(device)
     src = np.concatenate((rows, num_records + cols))
     dst = np.concatenate((num_records + cols, rows))
     return torch.from_numpy(np.stack((src, dst)).astype(np.int64)).to(device)
@@ -168,8 +171,9 @@ def load_module(path: Path, device: torch.device) -> torch.nn.Module:
     module = module.to(device)
     move_legacy_tensors(module, device)
     module.eval()
-    # feature_nodes is a legacy plain Tensor rather than a registered buffer.
-    if hasattr(module, "feature_nodes"):
+    # Registered parameters already moved with module.to(); legacy plain tensors
+    # still need explicit movement when loading non-GNN legacy module classes.
+    if hasattr(module, "feature_nodes") and not isinstance(module.feature_nodes, torch.nn.Parameter):
         module.feature_nodes = module.feature_nodes.to(device)
     if hasattr(module, "device"):
         module.device = device
@@ -221,7 +225,8 @@ def impute_missing(
     for start in range(0, len(rows), chunk_size):
         stop = min(start + chunk_size, len(rows))
         target_edges = build_target_edges(rows[start:stop], cols[start:stop],
-                                          features_normalized.shape[0], device)
+                                          features_normalized.shape[0], device,
+                                          bidirectional=False)
         prediction, _ = impute_model(
             obs_nodes_embs=obs_embeddings,
             fea_nodes_embs=feature_embeddings,

@@ -320,8 +320,8 @@ def prepare(args: argparse.Namespace) -> None:
 
 
 def train(args: argparse.Namespace) -> None:
-    if args.epochs < 1 or args.node_dim < 1 or args.edge_dim < 1:
-        raise ValueError("epochs and model dimensions must be positive")
+    if args.epochs < 1 or args.node_dim < 1 or args.edge_dim < 1 or args.impute_batch_size < 1:
+        raise ValueError("epochs, model dimensions and impute batch size must be positive")
     if not 0 < args.known < 1 or not 0 < args.train_edge < 1:
         raise ValueError("known and train-edge probabilities must be between 0 and 1")
     manifest = read_json(args.output_dir / "manifest.json")
@@ -337,6 +337,7 @@ def train(args: argparse.Namespace) -> None:
                "--epochs", str(args.epochs), "--gpu", args.gpu,
                "--seed", str(manifest["seed"]), "--node_dim", str(args.node_dim),
                "--edge_dim", str(args.edge_dim), "--impute_hiddens", str(args.node_dim),
+               "--impute_batch_size", str(args.impute_batch_size),
                "--known", str(args.known), "--valid", "0", "--save_model",
                "--log_dir", log_dir]
     if args.apply_attr:
@@ -464,11 +465,12 @@ def parse_args() -> argparse.Namespace:
     prep.add_argument("--xhar-root", type=Path, default=XHAR_ROOT)
     prep.add_argument("--update-xhar-configs", action="store_true")
     lerp = sub.add_parser("lerp", help="recompute interpolation using only saved masked artifacts")
-    training = sub.add_parser("train", help="run the unmodified standard M3 trainer")
+    training = sub.add_parser("train", help="run standard M3 with bounded decoder batches")
     training.add_argument("--epochs", type=int, default=200)
     training.add_argument("--gpu", default="0")
     training.add_argument("--node-dim", type=int, default=32)
     training.add_argument("--edge-dim", type=int, default=16)
+    training.add_argument("--impute-batch-size", type=int, default=1024)
     training.add_argument("--known", type=float, default=0.7)
     training.add_argument("--train-edge", type=float, default=0.7)
     training.add_argument("--log-dir", default=None)

@@ -2,9 +2,8 @@
 
 import torch
 from torch.nn import Parameter
-from torch_scatter import scatter_add
 from torch_geometric.nn.conv import MessagePassing
-from torch_geometric.utils import add_remaining_self_loops
+from torch_geometric.utils import add_remaining_self_loops, scatter
 
 from torch.nn.init import xavier_uniform_, zeros_
 
@@ -59,7 +58,7 @@ class EGCNConv(MessagePassing):
         #     edge_index, edge_weight, fill_value, num_nodes)
 
         row, col = edge_index
-        deg = scatter_add(edge_weight, row, dim=0, dim_size=num_nodes)
+        deg = scatter(edge_weight, row, dim=0, dim_size=num_nodes, reduce='sum')
 
         deg_inv_sqrt = deg.pow(-0.5)
         deg_inv_sqrt[deg_inv_sqrt == float('inf')] = 0
