@@ -7,16 +7,16 @@ authors = [
     { name = "Joseph Phantom", email = "qhdqsb@hotmail.com" },
     { name = "Zhongyi Yu", email = "zhongyicst@gmail.com"}
 ]
-requires-python = ">=3.11.15"
+requires-python = ">=3.12"
 dependencies = [
     "fancyimpute>=0.7.0",
     "hyperimpute>=0.1.17",
     "matplotlib>=3.11.2",
-    "numpy<2",
+    "numpy",
     "pyqt5>=5.15.11",
     "scipy>=1.17.1",
     "seaborn>=0.13.2",
-    "torch==2.1.0",
+    "torch==2.12.1",
     "torch-geometric>=2.8.0.post1",
-    "torchvision==0.16.0",
+    "torchvision==0.27.1",
 ]
