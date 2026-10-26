@@ -10,15 +10,20 @@ import sys
 import os
 import os.path as osp
 
-import numpy as np
-import torch
+from time import perf_counter
+from utils.progress import startup_stage
 
-
-from training.gnn_mdi import train_gnn_mdi
-from uci.uci_subparser import add_uci_subparser
-from mhealth.mhealth_data import add_mhealth_subparser
 
 def main():
+    startup_started = perf_counter()
+    # Emit a flushed message before importing Torch/PyG/scipy/matplotlib.
+    with startup_stage('Import training dependencies (NumPy, Torch, PyG, plotting)'):
+        import numpy as np
+        import torch
+        from training.gnn_mdi import train_gnn_mdi
+        from uci.uci_subparser import add_uci_subparser
+        from mhealth.mhealth_data import add_mhealth_subparser
+
     parser = argparse.ArgumentParser()
 
     # ----------------------------- Model -----------------------------
@@ -97,45 +102,50 @@ def main():
     # --------------------------- Device setup -------------------------
     # Set --gpu explicitly when running on a multi-GPU machine.  The rest of
     # the project receives a normal torch.device object from this block.
-    if torch.cuda.is_available():
-        # cuda = auto_select_gpu()                      # auto select most suitable GPU
-        cuda = args.gpu                                 # manual selection of gpu
-        print(f'[Config] Using GPU {args.gpu}')
-        os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-        os.environ['CUDA_VISIBLE_DEVICES'] = str(cuda)
-        device = torch.device('cuda:{}'.format(args.gpu))
-    else:
-        print('[Config] Using CPU')
-        device = torch.device('cpu')
+    with startup_stage('Select device and initialize random seeds'):
+        if torch.cuda.is_available():
+            # cuda = auto_select_gpu()                      # auto select most suitable GPU
+            cuda = args.gpu                                 # manual selection of gpu
+            print(f'[Config] Using GPU {args.gpu}')
+            os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+            os.environ['CUDA_VISIBLE_DEVICES'] = str(cuda)
+            device = torch.device('cuda:{}'.format(args.gpu))
+        else:
+            print('[Config] Using CPU')
+            device = torch.device('cpu')
 
-    seed = args.seed
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+        seed = args.seed
+        np.random.seed(seed)
+        torch.manual_seed(seed)
 
     # --------------------------- Dataset setup ------------------------
-    if args.domain == 'uci':
-        from uci.uci_data import load_data
-        data = load_data(args)
-    elif args.domain == 'mhealth':
-        from mhealth.mhealth_data import load_data
-        data = load_data(args)
-    else:
-        raise Exception('Unsupported datasets.')
+    with startup_stage('Load dataset and prepare graph'):
+        if args.domain == 'uci':
+            from uci.uci_data import load_data
+            data = load_data(args)
+        elif args.domain == 'mhealth':
+            from mhealth.mhealth_data import load_data
+            data = load_data(args)
+        else:
+            raise Exception('Unsupported datasets.')
 
 
     # Every repeated run writes into the same experiment directory and keeps
     # the exact command line in cmd_input.txt for later reproduction.
-    log_path = './{}/test/{}/{}/'.format(args.domain, args.data, args.log_dir)
-    if not os.path.exists(log_path):
-        os.makedirs(log_path)
+    with startup_stage('Prepare output directory and record command'):
+        log_path = './{}/test/{}/{}/'.format(args.domain, args.data, args.log_dir)
+        if not os.path.exists(log_path):
+            os.makedirs(log_path)
 
-    cmd_input = 'python ' + ' '.join(sys.argv) + '\n'
-    with open(osp.join(log_path, 'cmd_input.txt'), 'a') as f:
-        f.write(cmd_input)
+        cmd_input = 'python ' + ' '.join(sys.argv) + '\n'
+        with open(osp.join(log_path, 'cmd_input.txt'), 'a') as f:
+            f.write(cmd_input)
 
+    print(f"[Startup] Data ready; elapsed since launch: {perf_counter() - startup_started:.2f}s", flush=True)
     for run_iter_num in range(args.repeat_exp_num):
         args.seed = run_iter_num
-        print(f'[Config] seed: {args.seed}')
+        print(f'[Startup] Initialize training run {run_iter_num + 1}/{args.repeat_exp_num} on {device}', flush=True)
+        print(f'[Config] seed: {args.seed}', flush=True)
         train_gnn_mdi(data, args, log_path, run_iter_num, device, print_train_log=args.display_log)
 
 

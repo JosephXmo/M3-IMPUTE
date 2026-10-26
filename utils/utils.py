@@ -3,6 +3,8 @@ import numpy as np
 import os.path as osp
 import torch
 import subprocess
+import sys
+from tqdm import tqdm
 import scipy.stats as stats
 from scipy import optimize
 
@@ -71,7 +73,8 @@ def _mar_logistic_masking(X, rate_obs, rate_missing):
         if self_mask:
             d = len(coeffs)
             intercepts = torch.zeros(d)
-            for j in range(d):
+            for j in tqdm(range(d), desc="[Prepare] Fit missingness intercepts",
+                          unit="feature", file=sys.stdout, mininterval=0.5, dynamic_ncols=True):
 
                 def f(x):
                     return torch.sigmoid(X * coeffs[j] + x).mean().item() - p
@@ -80,7 +83,8 @@ def _mar_logistic_masking(X, rate_obs, rate_missing):
         else:
             d_obs, d_na = coeffs.shape
             intercepts = torch.zeros(d_na)
-            for j in range(d_na):
+            for j in tqdm(range(d_na), desc="[Prepare] Fit missingness intercepts",
+                          unit="feature", file=sys.stdout, mininterval=0.5, dynamic_ncols=True):
 
                 def f(x):
                     return torch.sigmoid(X.mv(coeffs[:, j]) + x).mean().item() - p

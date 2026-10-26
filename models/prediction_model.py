@@ -16,6 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import time
+from utils.progress import startup_stage
 from utils.utils import get_activation
 
 class Attr_Relation_Net(nn.Module):
@@ -261,7 +262,10 @@ class Similariy_Net(nn.Module):
 
     def __construct_sample_space(self, attn_score, feature_node_embs):
         # self.reconstruct_record = attn_score
-        self.update_cos_prob(feature_node_embs, attn_score)
+        candidates = self.sample_space_size if self.running_on_large_dataset else self.num_record
+        with startup_stage(f'Initialize SRU cosine sampling table ({self.num_record:,} x {candidates:,})',
+                           self.device):
+            self.update_cos_prob(feature_node_embs, attn_score)
     
 
     def sample_peer(self, KNOWN_Adjacency_matrix, N_of_Imputation, IMP_OBS_IDX):

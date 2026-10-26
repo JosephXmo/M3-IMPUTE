@@ -1,9 +1,8 @@
-"""Subject-separated HAR imputation benchmark, without changing M3 internals.
+"""Random-row HAR imputation benchmark using official 561-dimensional features.
 
-Stages: prepare S_train and the S0 family; train standard M3 on S_train;
-impute the explicitly masked S_drop with that checkpoint. ``lerp`` can be
-rerun using only saved benchmark artifacts, without reading source signals
-or the complete S0. The old drop-row benchmark is a separate experiment.
+Stages: prepare S_train and S0; train standard M3 on S_train; impute the
+explicitly masked S_drop with that checkpoint. Randomized rows have no time
+adjacency, so this protocol compares only S0, S_drop and S_m3.
 """
 
 from __future__ import annotations
@@ -66,32 +65,30 @@ def load_source(source: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return np.concatenate(xs), np.concatenate(ys), np.concatenate(subjects)
 
 
-def subject_split(subjects: np.ndarray, ratio: float) -> tuple[np.ndarray, dict]:
-    """Split original ordered rows; assign every tail subject fully to S0.
-
-    A shuffled row split followed by this rule could move almost every subject
-    to S0. Instead use the original train-then-test order and move only subjects
-    actually spanning the requested boundary. No subject is shared afterwards.
-    """
+def random_row_split(
+    subjects: np.ndarray, ratio: float, seed: int,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Sample rows without replacement, retaining the random order on both sides."""
     if not 0 < ratio < 1:
         raise ValueError("train ratio must be between 0 and 1")
     boundary = int(len(subjects) * ratio)
-    s0_subjects = np.unique(subjects[boundary:])
-    train = ~np.isin(subjects, s0_subjects)
-    if not train.any() or train.all():
-        raise ValueError("subject-priority split leaves one side empty")
+    if not 0 < boundary < len(subjects):
+        raise ValueError("row split leaves one side empty")
+    order = np.random.default_rng(seed).permutation(len(subjects))
+    train_ids, s0_ids = order[:boundary], order[boundary:]
+    train_subjects, s0_subjects = np.unique(subjects[train_ids]), np.unique(subjects[s0_ids])
     details = {
-        "rule": "ordered_rows_then_move_crossing_subjects_to_s0",
+        "rule": "random_rows_without_replacement",
+        "seed": seed,
         "requested_train_ratio": ratio,
-        "initial_boundary": boundary,
-        "moved_subjects": np.intersect1d(subjects[:boundary], s0_subjects).tolist(),
-        "train_subjects": np.unique(subjects[train]).tolist(),
+        "train_subjects": train_subjects.tolist(),
         "s0_subjects": s0_subjects.tolist(),
-        "train_rows": int(train.sum()),
-        "s0_rows": int((~train).sum()),
-        "actual_train_ratio": float(train.mean()),
+        "shared_subjects": np.intersect1d(train_subjects, s0_subjects).tolist(),
+        "train_rows": len(train_ids),
+        "s0_rows": len(s0_ids),
+        "actual_train_ratio": len(train_ids) / len(subjects),
     }
-    return train, details
+    return train_ids, s0_ids, details
 
 
 def training_statistics(features: np.ndarray) -> dict:
@@ -123,100 +120,11 @@ def verify_artifacts(output: Path, manifest: dict) -> None:
     for filename, key in (("missing_mask.txt", "mask_sha256"),
                           ("hhar_drop.txt", "drop_sha256"),
                           ("train_statistics.json", "statistics_sha256"),
-                          ("segments.txt", "segments_sha256")):
+                          ("train_row_ids.txt", "train_row_ids_sha256"),
+                          ("s0_row_ids.txt", "s0_row_ids_sha256"),
+                          ("hhar_labels.txt", "labels_sha256")):
         if digest(output / filename) != manifest[key]:
             raise ValueError(f"{filename} no longer matches the prepared experiment")
-
-
-def similarity_lerp(
-    dropped: np.ndarray, missing: np.ndarray, segments: np.ndarray, stats: dict,
-    radius: int = 5, side_margin: float = 0.1, side_ratio: float = 1.5,
-    min_overlap: int = 8,
-) -> tuple[np.ndarray, dict]:
-    """Predict missing cells from visible neighbors in a fixed +/-radius window.
-
-    Similarity uses the jointly observed other features, standardized by
-    S_train. A clearly better side supplies a weighted local line for bounded
-    extrapolation. Similar sides supply both sides for a local linear fit.
-    Missing candidate cells are never reused as observations, even after they
-    have been filled. No S0 truth, activity labels, or inertial signals enter.
-    """
-    if radius < 1 or min_overlap < 1 or not 0 <= side_margin <= 1 or side_ratio < 1:
-        raise ValueError("invalid similarity interpolation settings")
-    if dropped.shape != missing.shape or len(segments) != len(dropped):
-        raise ValueError("interpolation matrix, mask and segment shapes differ")
-    validate_statistics(stats, dropped.shape[1])
-    if not np.isfinite(dropped[~missing]).all():
-        raise ValueError("visible interpolation inputs must be finite")
-    means, std = np.asarray(stats["mean"]), np.asarray(stats["std"])
-    low, high = np.asarray(stats["minimum"]), np.asarray(stats["maximum"])
-    standardized = (np.where(missing, means, dropped) - means) / std
-    output = dropped.copy()
-    counts = dict(left=0, right=0, both=0, nearest=0, mean=0, clipped=0)
-    for row in np.flatnonzero(missing.any(1)):
-        neighbors = np.arange(max(0, row - radius), min(len(dropped), row + radius + 1))
-        neighbors = neighbors[(neighbors != row) & (segments[neighbors] == segments[row])]
-        common = ~missing[row] & ~missing[neighbors]
-        overlap = common.sum(1)
-        squared = (standardized[neighbors] - standardized[row]) ** 2
-        distance = np.sum(np.where(common, squared, 0.0), axis=1) / np.maximum(overlap, 1)
-        similarity = np.exp(-0.5 * distance)
-        usable = overlap >= min_overlap
-        for column in np.flatnonzero(missing[row]):
-            select = usable & ~missing[neighbors, column]
-            points, weights = neighbors[select], similarity[select]
-            left = points < row
-            left_score = float(weights[left].mean()) if left.any() else 0.0
-            right_score = float(weights[~left].mean()) if (~left).any() else 0.0
-            mode = "both"
-            if left.any() and (not (~left).any() or
-                              (left_score - right_score >= side_margin and
-                               left_score >= side_ratio * right_score)):
-                points, weights = points[left], weights[left]
-                mode = "left"
-            elif (~left).any() and (not left.any() or
-                                   (right_score - left_score >= side_margin and
-                                    right_score >= side_ratio * left_score)):
-                points, weights = points[~left], weights[~left]
-                mode = "right"
-            if len(points) == 0:
-                value, mode = means[column], "mean"
-            elif len(points) == 1:
-                value, mode = dropped[points[0], column], "nearest"
-            else:
-                # Weighted least-squares line in original row-distance units.
-                t = points - row
-                weights = np.maximum(weights, 1e-12)
-                weights = weights / weights.sum()
-                values = dropped[points, column]
-                t_mean, value_mean = weights @ t, weights @ values
-                variance = weights @ ((t - t_mean) ** 2)
-                slope = (weights @ ((t - t_mean) * (values - value_mean))) / variance
-                value = value_mean - slope * t_mean
-            if mode != "mean":
-                clipped = np.clip(value, low[column], high[column])
-                counts["clipped"] += int(clipped != value)
-                value = clipped
-            output[row, column] = value
-            counts[mode] += 1
-    return output, counts
-
-
-def interpolate_artifacts(output: Path, args: argparse.Namespace) -> dict:
-    # A new prepare run creates the manifest after interpolation; standalone
-    # lerp validates provenance first in main(), without touching complete S0.
-    dropped = np.loadtxt(output / "hhar_drop.txt", ndmin=2)
-    mask = np.loadtxt(output / "missing_mask.txt", dtype=bool, ndmin=2)
-    segments = np.loadtxt(output / "segments.txt", dtype=int, ndmin=1)
-    stats = read_json(output / "train_statistics.json")
-    result, counts = similarity_lerp(
-        dropped, mask, segments, stats, args.radius, args.side_margin,
-        args.side_ratio, args.min_overlap,
-    )
-    save_txt(output / "hhar_lerp.txt", result)
-    return {"radius": args.radius, "side_margin": args.side_margin,
-            "side_ratio": args.side_ratio, "min_overlap": args.min_overlap,
-            "counts": counts}
 
 
 def config_text(original: str, condition: str) -> str:
@@ -236,7 +144,7 @@ def update_configs(xhar: Path) -> None:
     # Read/validate all configs before writing any of them. Retain user's graph,
     # AE heatup, model, device, seed, repeat runner, and statistics settings.
     changes = []
-    for condition in ("s0", "drop", "lerp", "m3"):
+    for condition in ("s0", "drop", "m3"):
         path = xhar / CONFIG_DIR / f"hhar_{condition}.yaml"
         original = path.read_text()
         changes.append((path, original, config_text(original, condition)))
@@ -249,43 +157,42 @@ def prepare(args: argparse.Namespace) -> None:
     output = args.output_dir.resolve()
     if not 0 <= args.rate <= 1 or args.seed < 0:
         raise ValueError("missing rate must be in [0, 1] and seed nonnegative")
-    if args.radius < 1 or args.min_overlap < 1 or not 0 <= args.side_margin <= 1 or args.side_ratio < 1:
-        raise ValueError("invalid similarity interpolation settings")
     if args.update_xhar_configs:
         if output != (args.xhar_root / "data/missing-cross-comparison").resolve():
             raise ValueError("config patch expects <xhar-root>/data/missing-cross-comparison")
-        for condition in ("s0", "drop", "lerp", "m3"):
+        for condition in ("s0", "drop", "m3"):
             config_text((args.xhar_root / CONFIG_DIR / f"hhar_{condition}.yaml").read_text(), condition)
     source_x, labels, subjects = load_source(args.source)
-    train_mask, split = subject_split(subjects, args.train_ratio)
+    train_ids, ids, split = random_row_split(subjects, args.train_ratio, args.seed)
     # Export the exact serialized training matrix used by uci_data.load_data.
-    train_table = np.column_stack((source_x[train_mask], labels[train_mask]))
+    train_table = np.column_stack((source_x[train_ids], labels[train_ids]))
     save_txt(TRAIN_DATA / "data.txt", train_table)
     save_txt(TRAIN_DATA / "index_features.txt", np.arange(561), integer=True)
     save_txt(TRAIN_DATA / "index_target.txt", np.array([561]), integer=True)
     serialized_train = np.loadtxt(TRAIN_DATA / "data.txt", ndmin=2)[:, :-1]
     stats = training_statistics(serialized_train)
-    s0, ids = source_x[~train_mask], np.flatnonzero(~train_mask)
+    s0 = source_x[ids]
     mask = np.random.default_rng(args.seed).random(s0.shape) < args.rate
     dropped = np.where(mask, np.asarray(stats["mean"]), s0)
-    # Interpolation stays within contiguous subject runs in the original order.
-    all_segments = np.cumsum(np.r_[True, subjects[1:] != subjects[:-1]]) - 1
     output.mkdir(parents=True, exist_ok=True)
     save_txt(output / "hhar_s0.txt", s0)
     save_txt(output / "hhar_drop.txt", dropped)
-    save_txt(output / "hhar_labels.txt", labels[~train_mask], integer=True)
+    save_txt(output / "hhar_labels.txt", labels[ids], integer=True)
     save_txt(output / "missing_mask.txt", mask, integer=True)
     save_txt(output / "missing_indices.txt", np.argwhere(mask), integer=True)
     save_txt(output / "s0_row_ids.txt", ids, integer=True)
-    save_txt(output / "train_row_ids.txt", np.flatnonzero(train_mask), integer=True)
-    save_txt(output / "s0_subjects.txt", subjects[~train_mask], integer=True)
-    save_txt(output / "segments.txt", all_segments[~train_mask], integer=True)
+    save_txt(output / "train_row_ids.txt", train_ids, integer=True)
+    save_txt(output / "s0_subjects.txt", subjects[ids], integer=True)
     write_json(output / "train_statistics.json", stats)
     # NaNs explicitly distinguish hidden cells from valid mean-valued cells.
     save_txt(output / "hhar_missing.txt", np.where(mask, np.nan, dropped))
-    interpolation = interpolate_artifacts(output, args)
+    # Preserve old interpolation artifacts as clearly retired files.
+    for name in ("hhar_lerp.txt", "segments.txt"):
+        retired = output / name
+        if retired.exists():
+            retired.replace(output / f"{retired.stem}.retired-{digest(retired)[:12]}.txt")
     # Invalidate the previous M3 artifact when its source/mask changes. Move it
-    # aside rather than leave a stale fourth condition looking usable.
+    # aside rather than leave a stale condition looking usable.
     previous_path = output / "manifest.json"
     current_mask_hash = digest(output / "missing_mask.txt")
     current_train_hash = digest(TRAIN_DATA / "data.txt")
@@ -294,26 +201,28 @@ def prepare(args: argparse.Namespace) -> None:
     binding = {"train_sha256": current_train_hash, "mask_sha256": current_mask_hash,
                "s0_sha256": current_s0_hash, "drop_sha256": digest(output / "hhar_drop.txt"),
                "statistics_sha256": digest(output / "train_statistics.json"),
-               "segments_sha256": digest(output / "segments.txt")}
+               "train_row_ids_sha256": digest(output / "train_row_ids.txt"),
+               "s0_row_ids_sha256": digest(output / "s0_row_ids.txt"),
+               "labels_sha256": digest(output / "hhar_labels.txt")}
     unchanged = all(previous.get(key) == value for key, value in binding.items())
     if not unchanged and (output / "hhar_m3.txt").exists():
         stale = output / f"hhar_m3.stale-{digest(output / 'hhar_m3.txt')[:12]}.txt"
         (output / "hhar_m3.txt").replace(stale)
     manifest = {
-        "schema": 1, "seed": args.seed, "source_shape": list(source_x.shape),
+        "schema": 2, "seed": args.seed, "source_shape": list(source_x.shape),
         "split": split, "family_shape": list(s0.shape), "requested_missing_rate": args.rate,
         "missing_cells": int(mask.sum()), "actual_missing_rate": float(mask.mean()),
         "train_dataset": TRAIN_NAME, "train_data": str(TRAIN_DATA / "data.txt"),
-        **binding, "interpolation": interpolation,
+        **binding,
         "m3": previous.get("m3") if unchanged else None,
-        "conditions": {key: f"hhar_{key}.txt" for key in ("s0", "drop", "lerp", "m3")},
+        "conditions": {key: f"hhar_{key}.txt" for key in ("s0", "drop", "m3")},
         "labels": "hhar_labels.txt",
     }
     write_json(previous_path, manifest)
     if args.update_xhar_configs:
         update_configs(args.xhar_root)
     print(f"S_train={split['train_rows']}x561; S0-family={len(s0)}x561")
-    print(f"Crossing subjects moved to S0: {split['moved_subjects']}")
+    print(f"Random row split; shared subjects: {split['shared_subjects']}")
     print(f"Missing cells={mask.sum()} ({mask.mean():.4%}); seed={args.seed}")
     print(f"Output: {output}")
     print("S_m3 requires the separate train and impute stages.")
@@ -324,6 +233,7 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("epochs, model dimensions and impute batch size must be positive")
     if not 0 < args.known < 1 or not 0 < args.train_edge < 1:
         raise ValueError("known and train-edge probabilities must be between 0 and 1")
+    print("[Startup] Verify prepared S_train and checkpoint destination ...", flush=True)
     manifest = read_json(args.output_dir / "manifest.json")
     if digest(TRAIN_DATA / "data.txt") != manifest["train_sha256"]:
         raise ValueError("S_train no longer matches the prepared experiment")
@@ -333,7 +243,7 @@ def train(args: argparse.Namespace) -> None:
     checkpoint_dir = M3_ROOT / "uci/test" / TRAIN_NAME / log_dir
     if (checkpoint_dir / "model.pt").exists() or (checkpoint_dir / "impute_model.pt").exists():
         raise ValueError("checkpoint directory already contains weights; use a new --log-dir")
-    command = [sys.executable, str(M3_ROOT / "train_mdi.py"),
+    command = [sys.executable, "-u", str(M3_ROOT / "train_mdi.py"),
                "--epochs", str(args.epochs), "--gpu", args.gpu,
                "--seed", str(manifest["seed"]), "--node_dim", str(args.node_dim),
                "--edge_dim", str(args.edge_dim), "--impute_hiddens", str(args.node_dim),
@@ -346,6 +256,8 @@ def train(args: argparse.Namespace) -> None:
         command.extend(["--apply_peer", "--sample_strategy", args.sample_strategy,
                         "--very_large_dataset", "--sample_space_size", "20"])
     command.extend(["uci", "--data", TRAIN_NAME, "--train_edge", str(args.train_edge)])
+    print(f"[Startup] Launch M3 training: {manifest['split']['train_rows']:,} rows; "
+          f"checkpoint directory: {checkpoint_dir}", flush=True)
     subprocess.run(command, cwd=M3_ROOT, check=True)
     write_json(checkpoint_dir / "cross_comparison.json", {
         "train_sha256": manifest["train_sha256"], "training_rows": manifest["split"]["train_rows"],
@@ -385,7 +297,7 @@ def adapt_checkpoint(model, imputer, n_rows: int, n_features: int, dense, device
 def impute(args: argparse.Namespace) -> None:
     if args.chunk_size < 1:
         raise ValueError("chunk-size must be positive")
-    # Torch imports are delayed so all preparation/interpolation works with NumPy.
+    # Torch imports are delayed so all preparation works with NumPy.
     if str(HAR_DIR) not in sys.path:
         sys.path.insert(0, str(HAR_DIR))
     from generate_m3_representation import (
@@ -457,14 +369,13 @@ def impute(args: argparse.Namespace) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="stage", required=True)
-    prep = sub.add_parser("prepare", help="split subjects, simulate missingness, export baselines")
+    prep = sub.add_parser("prepare", help="randomly split rows, simulate missingness, export baselines")
     prep.add_argument("--source", type=Path, default=HAR_DIR / "original/UCI HAR Dataset")
     prep.add_argument("--train-ratio", type=float, default=0.7)
     prep.add_argument("--rate", type=float, default=0.1, help="cell-level MCAR missing probability")
     prep.add_argument("--seed", type=int, default=42)
     prep.add_argument("--xhar-root", type=Path, default=XHAR_ROOT)
     prep.add_argument("--update-xhar-configs", action="store_true")
-    lerp = sub.add_parser("lerp", help="recompute interpolation using only saved masked artifacts")
     training = sub.add_parser("train", help="run standard M3 with bounded decoder batches")
     training.add_argument("--epochs", type=int, default=200)
     training.add_argument("--gpu", default="0")
@@ -482,13 +393,8 @@ def parse_args() -> argparse.Namespace:
     prediction.add_argument("--checkpoint-dir", type=Path, required=True)
     prediction.add_argument("--device", default="auto")
     prediction.add_argument("--chunk-size", type=int, default=128)
-    for command in (prep, lerp, training, prediction):
+    for command in (prep, training, prediction):
         command.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
-    for command in (prep, lerp):
-        command.add_argument("--radius", type=int, default=5)
-        command.add_argument("--side-margin", type=float, default=0.1)
-        command.add_argument("--side-ratio", type=float, default=1.5)
-        command.add_argument("--min-overlap", type=int, default=8)
     return parser.parse_args()
 
 
@@ -500,13 +406,6 @@ def main() -> None:
         train(args)
     elif args.stage == "impute":
         impute(args)
-    else:
-        manifest = read_json(args.output_dir / "manifest.json")
-        verify_artifacts(args.output_dir, manifest)
-        interpolation = interpolate_artifacts(args.output_dir, args)
-        manifest["interpolation"] = interpolation
-        write_json(args.output_dir / "manifest.json", manifest)
-        print(interpolation)
 
 
 if __name__ == "__main__":

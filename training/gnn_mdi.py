@@ -9,6 +9,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import pickle
+import sys
+from time import perf_counter
+from utils.progress import startup_stage
 from tqdm import tqdm
 
 from models.gnn_model import get_gnn
@@ -74,7 +77,9 @@ def train_gnn_mdi(data, args, log_path, run_iter_num, device=torch.device('cpu')
     # The two modules are optimized together: GNNStack creates node embeddings
     # from the currently visible graph, and ImputeNet predicts hidden cells from
     # those embeddings plus the visibility mask.
-    model = get_gnn(data, args, device).to(device)
+    initialization_started = perf_counter()
+    with startup_stage(f'Initialize GNN encoder on {device}', device):
+        model = get_gnn(data, args, device).to(device)
     impute_batch_size = getattr(args, 'impute_batch_size', 1024)
     if impute_batch_size < 1:
         raise ValueError('impute_batch_size must be positive')
@@ -101,106 +106,116 @@ def train_gnn_mdi(data, args, log_path, run_iter_num, device=torch.device('cpu')
     Test_l1 = []
     Lr = []
 
-    x = data.x.clone().detach().to(device)
-    # Select the edge split used by this run.  ``split_sample`` optionally
-    # replaces the ordinary train/test view with lower/higher sample groups.
-    if hasattr(args,'split_sample') and args.split_sample > 0.:
-        if args.split_train:
-            all_train_edge_index = data.lower_train_edge_index.clone().detach().to(device)
-            all_train_edge_attr = data.lower_train_edge_attr.clone().detach().to(device)
-            all_train_labels = data.lower_train_labels.clone().detach().to(device)
+    with startup_stage('Copy graph tensors to training device', device):
+        x = data.x.clone().detach().to(device)
+        # Select the edge split used by this run.  ``split_sample`` optionally
+        # replaces the ordinary train/test view with lower/higher sample groups.
+        if hasattr(args,'split_sample') and args.split_sample > 0.:
+            if args.split_train:
+                all_train_edge_index = data.lower_train_edge_index.clone().detach().to(device)
+                all_train_edge_attr = data.lower_train_edge_attr.clone().detach().to(device)
+                all_train_labels = data.lower_train_labels.clone().detach().to(device)
+            else:
+                all_train_edge_index = data.train_edge_index.clone().detach().to(device)
+                all_train_edge_attr = data.train_edge_attr.clone().detach().to(device)
+                all_train_labels = data.train_labels.clone().detach().to(device)
+            if args.split_test:
+                test_input_edge_index = data.higher_train_edge_index.clone().detach().to(device)
+                test_input_edge_attr = data.higher_train_edge_attr.clone().detach().to(device)
+            else:
+                test_input_edge_index = data.train_edge_index.clone().detach().to(device)
+                test_input_edge_attr = data.train_edge_attr.clone().detach().to(device)
+            test_edge_index = data.higher_test_edge_index.clone().detach().to(device)
+            test_edge_attr = data.higher_test_edge_attr.clone().detach().to(device)
+            test_labels = data.higher_test_labels.clone().detach().to(device)
         else:
             all_train_edge_index = data.train_edge_index.clone().detach().to(device)
             all_train_edge_attr = data.train_edge_attr.clone().detach().to(device)
             all_train_labels = data.train_labels.clone().detach().to(device)
-        if args.split_test:
-            test_input_edge_index = data.higher_train_edge_index.clone().detach().to(device)
-            test_input_edge_attr = data.higher_train_edge_attr.clone().detach().to(device)
-        else:
-            test_input_edge_index = data.train_edge_index.clone().detach().to(device)
-            test_input_edge_attr = data.train_edge_attr.clone().detach().to(device)
-        test_edge_index = data.higher_test_edge_index.clone().detach().to(device)
-        test_edge_attr = data.higher_test_edge_attr.clone().detach().to(device)
-        test_labels = data.higher_test_labels.clone().detach().to(device)
-    else:
-        all_train_edge_index = data.train_edge_index.clone().detach().to(device)
-        all_train_edge_attr = data.train_edge_attr.clone().detach().to(device)
-        all_train_labels = data.train_labels.clone().detach().to(device)
-        test_input_edge_index = all_train_edge_index
-        test_input_edge_attr = all_train_edge_attr
-        test_edge_index = data.test_edge_index.clone().detach().to(device)
-        test_edge_attr = data.test_edge_attr.clone().detach().to(device)
-        test_labels = data.test_labels.clone().detach().to(device)
-    if hasattr(data,'class_values'):
-        class_values = data.class_values.detach().cpu()
+            test_input_edge_index = all_train_edge_index
+            test_input_edge_attr = all_train_edge_attr
+            test_edge_index = data.test_edge_index.clone().detach().to(device)
+            test_edge_attr = data.test_edge_attr.clone().detach().to(device)
+            test_labels = data.test_labels.clone().detach().to(device)
+        if hasattr(data,'class_values'):
+            class_values = data.class_values.detach().cpu()
     # Validation removes a fixed subset of train cells from the input graph;
     # their labels remain available only for model selection.
-    if args.valid > 0.:
-        valid_mask = get_known_mask(args.valid, int(all_train_edge_attr.shape[0] / 2), args.masking_distribution).to(device)
-        # print("valid mask sum: ",torch.sum(valid_mask))
-        train_labels = all_train_labels[~valid_mask]
-        valid_labels = all_train_labels[valid_mask]
-        double_valid_mask = torch.cat((valid_mask, valid_mask), dim=0)
-        valid_edge_index, valid_edge_attr = mask_edge(all_train_edge_index, all_train_edge_attr, double_valid_mask, True)
-        train_edge_index, train_edge_attr = mask_edge(all_train_edge_index, all_train_edge_attr, ~double_valid_mask, True)
-        # print("train edge num is {}, valid edge num is {}, test edge num is input {} output {}"\
-                # .format(
-                # train_edge_attr.shape[0], valid_edge_attr.shape[0],
-                # test_input_edge_attr.shape[0], test_edge_attr.shape[0]))
-        Valid_rmse = []
-        Valid_l1 = []
-        best_valid_rmse = np.inf
-        best_valid_rmse_epoch = 0
-        best_valid_l1 = np.inf
-        best_valid_l1_epoch = 0
-    else:
-        train_edge_index, train_edge_attr, train_labels =\
-             all_train_edge_index, all_train_edge_attr, all_train_labels
-        # print("train edge num is {}, test edge num is input {}, output {}"\
-                # .format(
-                # train_edge_attr.shape[0],
-                # test_input_edge_attr.shape[0], test_edge_attr.shape[0]))
-    if args.auto_known:
-        args.known = float(all_train_labels.shape[0])/float(all_train_labels.shape[0]+test_labels.shape[0])
-        # print("auto calculating known is {}/{} = {:.3g}".format(all_train_labels.shape[0],all_train_labels.shape[0]+test_labels.shape[0],args.known))
-    obj = dict()
-    obj['args'] = args
-    obj['outputs'] = dict()
+    with startup_stage('Prepare training and validation partitions', device):
+        if args.valid > 0.:
+            valid_mask = get_known_mask(args.valid, int(all_train_edge_attr.shape[0] / 2), args.masking_distribution).to(device)
+            # print("valid mask sum: ",torch.sum(valid_mask))
+            train_labels = all_train_labels[~valid_mask]
+            valid_labels = all_train_labels[valid_mask]
+            double_valid_mask = torch.cat((valid_mask, valid_mask), dim=0)
+            valid_edge_index, valid_edge_attr = mask_edge(all_train_edge_index, all_train_edge_attr, double_valid_mask, True)
+            train_edge_index, train_edge_attr = mask_edge(all_train_edge_index, all_train_edge_attr, ~double_valid_mask, True)
+            # print("train edge num is {}, valid edge num is {}, test edge num is input {} output {}"\
+                    # .format(
+                    # train_edge_attr.shape[0], valid_edge_attr.shape[0],
+                    # test_input_edge_attr.shape[0], test_edge_attr.shape[0]))
+            Valid_rmse = []
+            Valid_l1 = []
+            best_valid_rmse = np.inf
+            best_valid_rmse_epoch = 0
+            best_valid_l1 = np.inf
+            best_valid_l1_epoch = 0
+        else:
+            train_edge_index, train_edge_attr, train_labels =\
+                 all_train_edge_index, all_train_edge_attr, all_train_labels
+            # print("train edge num is {}, test edge num is input {}, output {}"\
+                    # .format(
+                    # train_edge_attr.shape[0],
+                    # test_input_edge_attr.shape[0], test_edge_attr.shape[0]))
+        if args.auto_known:
+            args.known = float(all_train_labels.shape[0])/float(all_train_labels.shape[0]+test_labels.shape[0])
+            # print("auto calculating known is {}/{} = {:.3g}".format(all_train_labels.shape[0],all_train_labels.shape[0]+test_labels.shape[0],args.known))
+        obj = dict()
+        obj['args'] = args
+        obj['outputs'] = dict()
     
 
     # -------------------- Build the imputation state --------------------
     # Find the first feature-node edge in the duplicated directed list.  The
     # first half contains sample -> feature edges and is enough to reconstruct
     # the dense sample-feature matrix.
-    tgt_v = torch.tensor([num_record], dtype=int, device=device)
-    idx = eliminate_feature_index(train_edge_index[0], tgt_v)
-    # ``A`` stores values (epsilon at hidden cells); ``Known_Mask`` stores the
-    # binary visibility information used by FCU/SRU.
-    A, Known_Mask = reconstruct_known_missing_A((num_record, num_feature), train_edge_index, train_edge_attr, num_record, device=device, idx=idx, epsilon=args.init_epsilon)
+    with startup_stage('Reconstruct dense values and visibility mask', device):
+        tgt_v = torch.tensor([num_record], dtype=int, device=device)
+        idx = eliminate_feature_index(train_edge_index[0], tgt_v)
+        # ``A`` stores values (epsilon at hidden cells); ``Known_Mask`` stores the
+        # binary visibility information used by FCU/SRU.
+        A, Known_Mask = reconstruct_known_missing_A((num_record, num_feature), train_edge_index, train_edge_attr, num_record, device=device, idx=idx, epsilon=args.init_epsilon)
     
-    impute_model = ImputeNet(hidden_dim = args.node_dim,
-                                num_of_record=num_record,
-                                num_of_feature=num_feature,
-                                device=device,
-                                num_sample_peer=args.sample_peer_size,
-                                apply_peer=args.apply_peer,
-                                apply_relation=args.apply_attr,
-                                record_data=data.df_X,
-                                sample_strategy=args.sample_strategy,
-                                cos_sample_feature_embs=model.feature_nodes,
-                                drop_p=args.impute_nn_dropout,
-                                running_on_very_large_dataset=args.very_large_dataset,
-                                sample_space_size=args.sample_space_size,
-                                attn_score=A)
+    with startup_stage('Initialize ImputeNet (FCU/SRU and peer sampler)', device):
+        impute_model = ImputeNet(hidden_dim = args.node_dim,
+                                    num_of_record=num_record,
+                                    num_of_feature=num_feature,
+                                    device=device,
+                                    num_sample_peer=args.sample_peer_size,
+                                    apply_peer=args.apply_peer,
+                                    apply_relation=args.apply_attr,
+                                    record_data=data.df_X,
+                                    sample_strategy=args.sample_strategy,
+                                    cos_sample_feature_embs=model.feature_nodes,
+                                    drop_p=args.impute_nn_dropout,
+                                    running_on_very_large_dataset=args.very_large_dataset,
+                                    sample_space_size=args.sample_space_size,
+                                    attn_score=A)
 
-    trainable_parameters = list(model.parameters()) \
-                           + list(impute_model.parameters())
-    # print("total trainable_parameters: ",len(trainable_parameters))
-    # Build one optimizer over both the encoder and imputation head.
-    scheduler, opt = build_optimizer(args, trainable_parameters)
+    with startup_stage('Create joint optimizer and scheduler', device):
+        trainable_parameters = list(model.parameters()) \
+                               + list(impute_model.parameters())
+        # print("total trainable_parameters: ",len(trainable_parameters))
+        # Build one optimizer over both the encoder and imputation head.
+        scheduler, opt = build_optimizer(args, trainable_parameters)
 
     # -------------------------- Optimization --------------------------
-    for epoch in tqdm(range(args.epochs)):
+    print(f'[Startup] Training ready: {num_record:,} samples, {num_feature:,} features, '
+          f'{len(train_labels):,} training cells; initialization '
+          f'{perf_counter() - initialization_started:.2f}s. Starting {args.epochs} epochs.',
+          flush=True)
+    for epoch in tqdm(range(args.epochs), desc='[Train] Epochs', unit='epoch',
+                      file=sys.stdout, dynamic_ncols=True):
         model.train()               # GNN encoder
         impute_model.train()        # Imputer
 

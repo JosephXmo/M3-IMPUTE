@@ -13,15 +13,24 @@ import preprocess_cross_comparison as pipeline
 
 
 class ProtocolTests(unittest.TestCase):
-    def test_crossing_subject_moves_entirely_to_s0(self):
-        subjects = np.array([1, 1, 2, 2, 3, 3, 3, 4, 4, 4])
-        train, info = pipeline.subject_split(subjects, 0.7)
-        self.assertEqual(info["moved_subjects"], [])
-        train, info = pipeline.subject_split(subjects, 0.6)
-        self.assertEqual(info["moved_subjects"], [3])
-        self.assertEqual(info["train_rows"], 4)
-        self.assertFalse(set(subjects[train]) & set(subjects[~train]))
-        self.assertGreaterEqual(info["s0_rows"], 4)
+    def test_random_split_is_disjoint_complete_reproducible_and_shuffled(self):
+        subjects = np.tile(np.arange(1, 31), 344)[:10299]
+        train, s0, info = pipeline.random_row_split(subjects, .7, 42)
+        self.assertEqual((len(train), len(s0)), (7209, 3090))
+        np.testing.assert_array_equal(np.sort(np.r_[train, s0]), np.arange(10299))
+        self.assertFalse(np.intersect1d(train, s0).size)
+        self.assertFalse(np.all(np.diff(train) > 0))
+        self.assertFalse(np.all(np.diff(s0) > 0))
+        again = pipeline.random_row_split(subjects, .7, 42)
+        np.testing.assert_array_equal(train, again[0])
+        np.testing.assert_array_equal(s0, again[1])
+        self.assertFalse(np.array_equal(train, pipeline.random_row_split(subjects, .7, 43)[0]))
+        self.assertEqual(info["shared_subjects"], list(range(1, 31)))
+
+    def test_invalid_or_empty_split_is_rejected(self):
+        for ratio in (0, 1, -.1, 1.1, .01):
+            with self.subTest(ratio=ratio), self.assertRaises(ValueError):
+                pipeline.random_row_split(np.arange(10), ratio, 42)
 
     def test_statistics_match_sklearn_including_constant_columns(self):
         if importlib.util.find_spec("sklearn") is None:
@@ -33,74 +42,65 @@ class ProtocolTests(unittest.TestCase):
         np.testing.assert_allclose(stats["minmax_scale"], scaler.scale_)
         np.testing.assert_allclose(stats["minmax_offset"], scaler.min_)
 
-    def test_prepare_uses_train_only_statistics_and_deterministic_mask(self):
+    def test_prepare_alignment_statistics_masks_and_retired_artifacts(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             source, output, training = root / "source", root / "output", root / "training"
             x = np.repeat(np.arange(10, dtype=float)[:, None], 561, axis=1)
+            labels = np.arange(10) % 6 + 1
             subjects = np.array([1, 1, 2, 2, 3, 3, 3, 4, 4, 4])
             for name, sl in (("train", slice(0, 7)), ("test", slice(7, 10))):
                 pipeline.save_txt(source / name / f"X_{name}.txt", x[sl])
-                pipeline.save_txt(source / name / f"y_{name}.txt", np.ones(len(x[sl])), True)
+                pipeline.save_txt(source / name / f"y_{name}.txt", labels[sl], True)
                 pipeline.save_txt(source / name / f"subject_{name}.txt", subjects[sl], True)
-            args = argparse.Namespace(output_dir=output, source=source, train_ratio=.6,
-                                      rate=.2, seed=42, radius=5, min_overlap=8,
-                                      side_margin=.1, side_ratio=1.5, update_xhar_configs=False)
+            args = argparse.Namespace(output_dir=output, source=source, train_ratio=.7,
+                                      rate=.2, seed=42, update_xhar_configs=False)
+            for name in ("hhar_lerp.txt", "segments.txt", "hhar_m3.txt"):
+                pipeline.save_txt(output / name, np.array([123.]))
             with patch.object(pipeline, "TRAIN_DATA", training):
                 pipeline.prepare(args)
                 first_mask = (output / "missing_mask.txt").read_bytes()
+                first_manifest = pipeline.read_json(output / "manifest.json")
                 pipeline.prepare(args)
             self.assertEqual(first_mask, (output / "missing_mask.txt").read_bytes())
+            self.assertEqual(first_manifest, pipeline.read_json(output / "manifest.json"))
+            train_ids = np.loadtxt(output / "train_row_ids.txt", dtype=int)
+            s0_ids = np.loadtxt(output / "s0_row_ids.txt", dtype=int)
+            np.testing.assert_array_equal(np.sort(np.r_[train_ids, s0_ids]), np.arange(10))
+            np.testing.assert_array_equal(np.loadtxt(training / "data.txt"),
+                                          np.column_stack((x[train_ids], labels[train_ids])))
+            np.testing.assert_array_equal(np.loadtxt(output / "hhar_labels.txt"), labels[s0_ids])
+            np.testing.assert_array_equal(np.loadtxt(output / "s0_subjects.txt"), subjects[s0_ids])
             stats = pipeline.read_json(output / "train_statistics.json")
-            np.testing.assert_allclose(stats["mean"], 1.5)
+            np.testing.assert_allclose(stats["mean"], x[train_ids].mean(0))
             s0 = np.loadtxt(output / "hhar_s0.txt")
+            np.testing.assert_array_equal(s0, x[s0_ids])
             drop = np.loadtxt(output / "hhar_drop.txt")
-            lerp = np.loadtxt(output / "hhar_lerp.txt")
             mask = np.loadtxt(output / "missing_mask.txt", dtype=bool)
             np.testing.assert_array_equal(drop[~mask], s0[~mask])
-            np.testing.assert_array_equal(lerp[~mask], s0[~mask])
-            np.testing.assert_allclose(drop[mask], 1.5)
-            self.assertEqual(s0.shape, (6, 561))
-            self.assertEqual(np.loadtxt(training / "data.txt").shape, (4, 562))
-            # Remove all true/source data. Interpolation still runs identically.
-            (output / "hhar_s0.txt").unlink()
-            for path in source.rglob("*.txt"):
-                path.unlink()
-            pipeline.verify_artifacts(output, pipeline.read_json(output / "manifest.json"))
-            pipeline.interpolate_artifacts(output, args)
-            np.testing.assert_array_equal(np.loadtxt(output / "hhar_lerp.txt"), lerp)
-
-    def interpolation_case(self, visible_feature, segments=None):
-        x = np.column_stack((np.arange(5, dtype=float), visible_feature))
-        mask = np.zeros_like(x, dtype=bool)
-        mask[2, 0] = True
-        x[2, 0] = 9999
-        stats = pipeline.training_statistics(np.array([[0., -1.], [4., 1.]]))
-        stats["std"] = [1., 1.]
-        return x, mask, np.zeros(5, dtype=int) if segments is None else segments, stats
-
-    def test_left_right_and_both_direction_selection(self):
-        for feature, mode in (([0, 0, 0, 10, 10], "left"),
-                              ([10, 10, 0, 0, 0], "right"),
-                              ([0, 0, 0, 0, 0], "both")):
-            args = self.interpolation_case(feature)
-            result, counts = pipeline.similarity_lerp(*args, min_overlap=1)
-            self.assertEqual(counts[mode], 1)
-            self.assertAlmostEqual(result[2, 0], 2)
-            np.testing.assert_array_equal(result[~args[1]], args[0][~args[1]])
-
-    def test_masked_placeholders_do_not_affect_prediction(self):
-        x, mask, segments, stats = self.interpolation_case([0] * 5)
-        first, _ = pipeline.similarity_lerp(x, mask, segments, stats, min_overlap=1)
-        x[mask] = np.nan
-        second, _ = pipeline.similarity_lerp(x, mask, segments, stats, min_overlap=1)
-        np.testing.assert_array_equal(first, second)
-
-    def test_no_cross_segment_interpolation(self):
-        args = self.interpolation_case([0] * 5, np.array([0, 0, 1, 2, 2]))
-        result, counts = pipeline.similarity_lerp(*args, min_overlap=1)
-        self.assertEqual(counts["mean"], 1)
-        self.assertEqual(result[2, 0], args[3]["mean"][0])
+            np.testing.assert_allclose(drop[mask], x[train_ids].mean())
+            missing = np.loadtxt(output / "hhar_missing.txt")
+            np.testing.assert_array_equal(np.isnan(missing), mask)
+            np.testing.assert_array_equal(missing[~mask], s0[~mask])
+            self.assertEqual(s0.shape, (3, 561))
+            self.assertEqual(set(first_manifest["conditions"]), {"s0", "drop", "m3"})
+            for name in ("hhar_lerp.txt", "segments.txt", "hhar_m3.txt"):
+                self.assertFalse((output / name).exists())
+            self.assertTrue(list(output.glob("hhar_lerp.retired-*.txt")))
+            self.assertTrue(list(output.glob("hhar_m3.stale-*.txt")))
+            pipeline.verify_artifacts(output, first_manifest)
+            # Rate changes leave the split and its training checkpoint binding intact.
+            args.rate = 1.
+            with patch.object(pipeline, "TRAIN_DATA", training):
+                pipeline.prepare(args)
+            changed = pipeline.read_json(output / "manifest.json")
+            self.assertEqual(changed["train_sha256"], first_manifest["train_sha256"])
+            self.assertEqual(changed["s0_sha256"], first_manifest["s0_sha256"])
+            self.assertEqual(changed["actual_missing_rate"], 1.)
+            # Row-order metadata must remain bound to the prepared artifacts.
+            pipeline.save_txt(output / "s0_row_ids.txt", s0_ids[::-1], True)
+            with self.assertRaisesRegex(ValueError, "s0_row_ids"):
+                pipeline.verify_artifacts(output, changed)
 
     def test_config_patch_preserves_training_settings_and_comments(self):
         original = '# X_path: old\nX_path: "old"\ny_path: "old-label"\nseed: 42\ngraph_path: ""\n'

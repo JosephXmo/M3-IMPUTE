@@ -9,6 +9,9 @@ two directed edges so the GNN can pass messages in both directions.
 import pandas as pd
 import os.path as osp
 import inspect
+import sys
+from tqdm import tqdm
+from utils.progress import startup_stage
 from torch_geometric.data import Data
 from sklearn import preprocessing
 
@@ -49,7 +52,8 @@ def create_edge(df):
     n_row, n_col = df.shape
     edge_start = []
     edge_end = []
-    for x in range(n_row):
+    for x in tqdm(range(n_row), desc="[Prepare] Bipartite edge rows",
+                  unit="row", file=sys.stdout, mininterval=0.5, dynamic_ncols=True):
         edge_start = edge_start + [x] * n_col # sample node
         edge_end = edge_end + list(n_row+np.arange(n_col)) # feature node
     edge_start_new = edge_start + edge_end
@@ -60,7 +64,8 @@ def create_edge_attr(df):
     """Use the normalized cell value as a scalar attribute on each edge."""
     nrow, ncol = df.shape
     edge_attr = []
-    for i in range(nrow):
+    for i in tqdm(range(nrow), desc="[Prepare] Edge value rows",
+                  unit="row", file=sys.stdout, mininterval=0.5, dynamic_ncols=True):
         for j in range(ncol):
             edge_attr.append([float(df.iloc[i,j])])
     edge_attr = edge_attr + edge_attr
@@ -82,112 +87,125 @@ def get_data(df_X, df_y, node_mode, train_edge_prob, split_sample_ratio, split_b
         # The model predicts normalized edge values.  Keep ``df_y`` separate:
         # it is used for the downstream target split and is not an imputation
         # feature node.
-        x = df_X.values
-        min_max_scaler = preprocessing.MinMaxScaler()
-        x_scaled = min_max_scaler.fit_transform(x)      # 将raw data feature (0.3, 0.7, ...)用min_max norm一下
-        df_X = pd.DataFrame(x_scaled)                   # 转换为DataFrame形式
+        with startup_stage('Fit MinMaxScaler and normalize feature matrix'):
+            x = df_X.values
+            min_max_scaler = preprocessing.MinMaxScaler()
+            x_scaled = min_max_scaler.fit_transform(x)      # 将raw data feature (0.3, 0.7, ...)用min_max norm一下
+            df_X = pd.DataFrame(x_scaled)                   # 转换为DataFrame形式
 
     # Build the complete bidirectional sample-feature graph once.  Later masks
     # select train/test edges without changing node indices.
-    edge_start, edge_end = create_edge(df_X)
-    edge_index = torch.tensor([edge_start, edge_end], dtype=int)
-    edge_attr = torch.tensor(create_edge_attr(df_X), dtype=torch.float)
-    # Node rows are ordered as samples first and features second; this order is
-    # relied on by the GNN and by ImputeNet.get_imp_obs_fea_pair_index().
-    node_init = create_node(df_X, node_mode) 
-    x = torch.tensor(node_init, dtype=torch.float)
-    y = torch.tensor(df_y, dtype=torch.float)
-    
+    n_rows, n_features = df_X.shape
+    print(f'[Startup] Table: {n_rows:,} rows x {n_features:,} features; '
+          f'{2 * n_rows * n_features:,} directed edges', flush=True)
+    with startup_stage('Build sample-feature edge lists'):
+        edge_start, edge_end = create_edge(df_X)
+    with startup_stage('Convert edge indices to tensors'):
+        edge_index = torch.tensor([edge_start, edge_end], dtype=int)
+    with startup_stage('Build edge values and convert to tensors'):
+        edge_attr = torch.tensor(create_edge_attr(df_X), dtype=torch.float)
+    # Preserve the [samples, features] node order used by the predictor.
+    with startup_stage('Build initial node features and target tensors'):
+        node_init = create_node(df_X, node_mode)
+        x = torch.tensor(node_init, dtype=torch.float)
+        y = torch.tensor(df_y, dtype=torch.float)
+
     print(f'[Config] Known Ratio (i.e. Training Edge Ratio): {train_edge_prob}, Missing Ratio (i.e. Testing Impute Edge Ratio): {1 - train_edge_prob}')
 
     # Fix the initial train/test split for reproducible experiments.
-    torch.manual_seed(seed)
-    # Keep the selected fraction of undirected cells.  Both directions receive
-    # the same mask so the graph remains symmetric at the cell level.
-    train_edge_mask = train_test_mask(train_edge_prob, int(edge_attr.shape[0]/2), mode=args.corrupt, mask_dist=args.masking_distribution, X=df_X, args=args)
-    # train_edge_mask = get_known_mask(train_edge_prob, int(edge_attr.shape[0]/2), args.masking_distribution)
-    double_train_edge_mask = torch.cat((train_edge_mask, train_edge_mask), dim=0)
+    with startup_stage('Generate initial cell missingness mask'):
+        torch.manual_seed(seed)
+        # Keep the selected fraction of undirected cells.  Both directions receive
+        # the same mask so the graph remains symmetric at the cell level.
+        train_edge_mask = train_test_mask(train_edge_prob, int(edge_attr.shape[0]/2), mode=args.corrupt, mask_dist=args.masking_distribution, X=df_X, args=args)
+        # train_edge_mask = get_known_mask(train_edge_prob, int(edge_attr.shape[0]/2), args.masking_distribution)
+        double_train_edge_mask = torch.cat((train_edge_mask, train_edge_mask), dim=0)
 
     # ``train_edge_*`` are observed cells; ``test_edge_*`` are hidden cells.
-    train_edge_index, train_edge_attr = mask_edge(edge_index, edge_attr,
-                                                double_train_edge_mask, True)
-    train_labels = train_edge_attr[:int(train_edge_attr.shape[0]/2),0]
-    test_edge_index, test_edge_attr = mask_edge(edge_index, edge_attr,
-                                                ~double_train_edge_mask, True)
-    test_labels = test_edge_attr[:int(test_edge_attr.shape[0]/2),0]
-    # The target column has its own sample split for downstream evaluation.
-    train_y_mask = get_known_mask(train_y_prob, y.shape[0], args.masking_distribution)
-    test_y_mask = ~train_y_mask
+    with startup_stage('Materialize train/test graph partitions'):
+        train_edge_index, train_edge_attr = mask_edge(edge_index, edge_attr,
+                                                    double_train_edge_mask, True)
+        train_labels = train_edge_attr[:int(train_edge_attr.shape[0]/2),0]
+        test_edge_index, test_edge_attr = mask_edge(edge_index, edge_attr,
+                                                    ~double_train_edge_mask, True)
+        test_labels = test_edge_attr[:int(test_edge_attr.shape[0]/2),0]
+        # The target column has its own sample split for downstream evaluation.
+        train_y_mask = get_known_mask(train_y_prob, y.shape[0], args.masking_distribution)
+        test_y_mask = ~train_y_mask
 
-    data = Data(x=x, y=y, edge_index=edge_index, edge_attr=edge_attr,
-            train_y_mask=train_y_mask, test_y_mask=test_y_mask,
-            train_edge_index=train_edge_index,train_edge_attr=train_edge_attr,
-            train_edge_mask=train_edge_mask,train_labels=train_labels,
-            test_edge_index=test_edge_index,test_edge_attr=test_edge_attr,
-            test_edge_mask=~train_edge_mask,test_labels=test_labels, 
-            df_X=df_X,df_y=df_y,
-            edge_attr_dim=train_edge_attr.shape[-1],
-            user_num=df_X.shape[0]
-            )
+    with startup_stage('Assemble graph data'):
+        data = Data(x=x, y=y, edge_index=edge_index, edge_attr=edge_attr,
+                train_y_mask=train_y_mask, test_y_mask=test_y_mask,
+                train_edge_index=train_edge_index,train_edge_attr=train_edge_attr,
+                train_edge_mask=train_edge_mask,train_labels=train_labels,
+                test_edge_index=test_edge_index,test_edge_attr=test_edge_attr,
+                test_edge_mask=~train_edge_mask,test_labels=test_labels,
+                df_X=df_X,df_y=df_y,
+                edge_attr_dim=train_edge_attr.shape[-1],
+                user_num=df_X.shape[0]
+                )
 
     if split_sample_ratio > 0.:
-        # Optional cold-start split: keep the graph topology but partition
-        # sample rows into lower/higher groups according to y or at random.
-        if split_by == 'y':
-            sorted_y, sorted_y_index = torch.sort(torch.reshape(y,(-1,)))
-        elif split_by == 'random':
-            sorted_y_index = torch.randperm(y.shape[0])
-        lower_y_index = sorted_y_index[:int(np.floor(y.shape[0]*split_sample_ratio))]
-        higher_y_index = sorted_y_index[int(np.floor(y.shape[0]*split_sample_ratio)):]
-        # here we don't split x, only split edge
-        # train
-        half_train_edge_index = train_edge_index[:,:int(train_edge_index.shape[1]/2)];
-        lower_train_edge_mask = []
-        for node_index in half_train_edge_index[0]:
-            if node_index in lower_y_index:
-                lower_train_edge_mask.append(True)
-            else:
-                lower_train_edge_mask.append(False)
-        lower_train_edge_mask = torch.tensor(lower_train_edge_mask)
-        double_lower_train_edge_mask = torch.cat((lower_train_edge_mask, lower_train_edge_mask), dim=0)
-        lower_train_edge_index, lower_train_edge_attr = mask_edge(train_edge_index, train_edge_attr,
-                                                double_lower_train_edge_mask, True)
-        lower_train_labels = lower_train_edge_attr[:int(lower_train_edge_attr.shape[0]/2),0]
-        higher_train_edge_index, higher_train_edge_attr = mask_edge(train_edge_index, train_edge_attr,
-                                                ~double_lower_train_edge_mask, True)
-        higher_train_labels = higher_train_edge_attr[:int(higher_train_edge_attr.shape[0]/2),0]
-        # test
-        half_test_edge_index = test_edge_index[:,:int(test_edge_index.shape[1]/2)];
-        lower_test_edge_mask = []
-        for node_index in half_test_edge_index[0]:
-            if node_index in lower_y_index:
-                lower_test_edge_mask.append(True)
-            else:
-                lower_test_edge_mask.append(False)
-        lower_test_edge_mask = torch.tensor(lower_test_edge_mask)
-        double_lower_test_edge_mask = torch.cat((lower_test_edge_mask, lower_test_edge_mask), dim=0)
-        lower_test_edge_index, lower_test_edge_attr = mask_edge(test_edge_index, test_edge_attr,
-                                                double_lower_test_edge_mask, True)
-        lower_test_labels = lower_test_edge_attr[:int(lower_test_edge_attr.shape[0]/2),0]
-        higher_test_edge_index, higher_test_edge_attr = mask_edge(test_edge_index, test_edge_attr,
-                                                ~double_lower_test_edge_mask, True)
-        higher_test_labels = higher_test_edge_attr[:int(higher_test_edge_attr.shape[0]/2),0]
+        with startup_stage('Partition cold-start samples'):
+            # Optional cold-start split: keep the graph topology but partition
+            # sample rows into lower/higher groups according to y or at random.
+            if split_by == 'y':
+                sorted_y, sorted_y_index = torch.sort(torch.reshape(y,(-1,)))
+            elif split_by == 'random':
+                sorted_y_index = torch.randperm(y.shape[0])
+            lower_y_index = sorted_y_index[:int(np.floor(y.shape[0]*split_sample_ratio))]
+            higher_y_index = sorted_y_index[int(np.floor(y.shape[0]*split_sample_ratio)):]
+            # here we don't split x, only split edge
+            # train
+            half_train_edge_index = train_edge_index[:,:int(train_edge_index.shape[1]/2)];
+            lower_train_edge_mask = []
+            for node_index in tqdm(half_train_edge_index[0], desc="[Prepare] Cold-start train edges",
+                                   unit="edge", file=sys.stdout, mininterval=0.5, dynamic_ncols=True):
+                if node_index in lower_y_index:
+                    lower_train_edge_mask.append(True)
+                else:
+                    lower_train_edge_mask.append(False)
+            lower_train_edge_mask = torch.tensor(lower_train_edge_mask)
+            double_lower_train_edge_mask = torch.cat((lower_train_edge_mask, lower_train_edge_mask), dim=0)
+            lower_train_edge_index, lower_train_edge_attr = mask_edge(train_edge_index, train_edge_attr,
+                                                    double_lower_train_edge_mask, True)
+            lower_train_labels = lower_train_edge_attr[:int(lower_train_edge_attr.shape[0]/2),0]
+            higher_train_edge_index, higher_train_edge_attr = mask_edge(train_edge_index, train_edge_attr,
+                                                    ~double_lower_train_edge_mask, True)
+            higher_train_labels = higher_train_edge_attr[:int(higher_train_edge_attr.shape[0]/2),0]
+            # test
+            half_test_edge_index = test_edge_index[:,:int(test_edge_index.shape[1]/2)];
+            lower_test_edge_mask = []
+            for node_index in tqdm(half_test_edge_index[0], desc="[Prepare] Cold-start test edges",
+                                   unit="edge", file=sys.stdout, mininterval=0.5, dynamic_ncols=True):
+                if node_index in lower_y_index:
+                    lower_test_edge_mask.append(True)
+                else:
+                    lower_test_edge_mask.append(False)
+            lower_test_edge_mask = torch.tensor(lower_test_edge_mask)
+            double_lower_test_edge_mask = torch.cat((lower_test_edge_mask, lower_test_edge_mask), dim=0)
+            lower_test_edge_index, lower_test_edge_attr = mask_edge(test_edge_index, test_edge_attr,
+                                                    double_lower_test_edge_mask, True)
+            lower_test_labels = lower_test_edge_attr[:int(lower_test_edge_attr.shape[0]/2),0]
+            higher_test_edge_index, higher_test_edge_attr = mask_edge(test_edge_index, test_edge_attr,
+                                                    ~double_lower_test_edge_mask, True)
+            higher_test_labels = higher_test_edge_attr[:int(higher_test_edge_attr.shape[0]/2),0]
 
 
-        data.lower_y_index = lower_y_index
-        data.higher_y_index = higher_y_index
-        data.lower_train_edge_index = lower_train_edge_index
-        data.lower_train_edge_attr = lower_train_edge_attr
-        data.lower_train_labels = lower_train_labels
-        data.higher_train_edge_index = higher_train_edge_index
-        data.higher_train_edge_attr = higher_train_edge_attr
-        data.higher_train_labels = higher_train_labels
-        data.lower_test_edge_index = lower_test_edge_index
-        data.lower_test_edge_attr = lower_test_edge_attr
-        data.lower_test_labels = lower_train_labels
-        data.higher_test_edge_index = higher_test_edge_index
-        data.higher_test_edge_attr = higher_test_edge_attr
-        data.higher_test_labels = higher_test_labels
+            data.lower_y_index = lower_y_index
+            data.higher_y_index = higher_y_index
+            data.lower_train_edge_index = lower_train_edge_index
+            data.lower_train_edge_attr = lower_train_edge_attr
+            data.lower_train_labels = lower_train_labels
+            data.higher_train_edge_index = higher_train_edge_index
+            data.higher_train_edge_attr = higher_train_edge_attr
+            data.higher_train_labels = higher_train_labels
+            data.lower_test_edge_index = lower_test_edge_index
+            data.lower_test_edge_attr = lower_test_edge_attr
+            data.lower_test_labels = lower_train_labels
+            data.higher_test_edge_index = higher_test_edge_index
+            data.higher_test_edge_attr = higher_test_edge_attr
+            data.higher_test_labels = higher_test_labels
         
     return data
 
@@ -195,7 +213,8 @@ def load_data(args):
     """Load ``uci/raw_data/<name>/data/data.txt`` using CLI arguments."""
     uci_path = osp.dirname(osp.abspath(inspect.getfile(inspect.currentframe())))
     data_path = osp.join(uci_path, 'raw_data', args.data, 'data', 'data.txt')
-    df_np = np.loadtxt(data_path)
+    with startup_stage(f'Read feature table: {data_path}'):
+        df_np = np.loadtxt(data_path)
     df_y = pd.DataFrame(df_np[:, -1:])
     df_X = pd.DataFrame(df_np[:, :-1])
     if not hasattr(args,'split_sample'):
