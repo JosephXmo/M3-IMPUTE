@@ -244,7 +244,7 @@ def train(args: argparse.Namespace) -> None:
     if (checkpoint_dir / "model.pt").exists() or (checkpoint_dir / "impute_model.pt").exists():
         raise ValueError("checkpoint directory already contains weights; use a new --log-dir")
     command = [sys.executable, "-u", str(M3_ROOT / "train_mdi.py"),
-               "--epochs", str(args.epochs), "--gpu", args.gpu,
+               "--epochs", str(args.epochs), "--gpu", str(args.gpu),
                "--seed", str(manifest["seed"]), "--node_dim", str(args.node_dim),
                "--edge_dim", str(args.edge_dim), "--impute_hiddens", str(args.node_dim),
                "--impute_batch_size", str(args.impute_batch_size),
@@ -378,7 +378,9 @@ def parse_args() -> argparse.Namespace:
     prep.add_argument("--update-xhar-configs", action="store_true")
     training = sub.add_parser("train", help="run standard M3 with bounded decoder batches")
     training.add_argument("--epochs", type=int, default=200)
-    training.add_argument("--gpu", default="0")
+    training.add_argument("--gpu", type=int, default=0,
+                          help="forward to train_mdi.py: when MPS is available, "
+                               "0=MPS and N>=1=cuda:N-1; otherwise N=cuda:N (default: 0)")
     training.add_argument("--node-dim", type=int, default=32)
     training.add_argument("--edge-dim", type=int, default=16)
     training.add_argument("--impute-batch-size", type=int, default=1024)

@@ -75,7 +75,7 @@ uci/test/har_cross_train/cross_random_32_16_seed42/
 
 64/64 对应目录为 `cross_random_64_64_seed42`。
 原训练器会在循环中把打印的 `args.seed` 改为重复实验编号（单次为 0），但最初 NumPy/PyTorch 初始化和数据掩码仍使用命令传入的 42。
-此流水线不修改这一既有行为，包装器记录实际传入的种子。GPU 使用现有训练器的设备选择逻辑，单卡建议 `--gpu 0`。
+此流水线不修改这一既有行为，包装器记录实际传入的种子。包装器默认 `--gpu 0`，将编号原样传给训练入口。训练入口用 `torch.backends.mps.is_available()` 检测：MPS 可用时，`0` 为 MPS、`1` 为 `cuda:0`，后续依次递增；否则编号直接对应 CUDA。所选 CUDA 后端不可用时提示并回退 CPU，可见设备编号越界时报错。补全阶段仍通过 `--device mps` 显式选择 MPS。
 
 ### 使用训练好的权重生成 S_m3
 

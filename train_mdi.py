@@ -14,6 +14,27 @@ from time import perf_counter
 from utils.progress import startup_stage
 
 
+def select_training_device(gpu):
+    """Map CLI indices to MPS/CUDA, respecting externally visible CUDA devices."""
+    import torch
+
+    if gpu < 0:
+        raise ValueError('--gpu must be nonnegative')
+    has_mps = torch.backends.mps.is_available()
+    if has_mps and gpu == 0:
+        return torch.device('mps')
+
+    cuda_index = gpu - 1 if has_mps else gpu
+    if not torch.cuda.is_available():
+        print(f'[Config] CUDA device {cuda_index} requested but CUDA unavailable; using CPU',
+              flush=True)
+        return torch.device('cpu')
+    if cuda_index >= torch.cuda.device_count():
+        raise ValueError(f'--gpu {gpu} maps to cuda:{cuda_index}, but only '
+                         f'{torch.cuda.device_count()} CUDA devices are visible')
+    return torch.device(f'cuda:{cuda_index}')
+
+
 def main():
     startup_started = perf_counter()
     # Emit a flushed message before importing Torch/PyG/scipy/matplotlib.
@@ -66,7 +87,9 @@ def main():
     parser.add_argument('--transfer_dir', type=str, default=None)
     parser.add_argument('--transfer_extra', type=str, default='')
     parser.add_argument('--mode', type=str, default='train')
-    parser.add_argument('--gpu', type=str, default='1')
+    parser.add_argument('--gpu', type=int, default=0 if torch.backends.mps.is_available() else 1,
+                        help='when MPS is available: 0=MPS, N>=1=cuda:N-1; '
+                             'otherwise N=cuda:N (default: MPS available 0, otherwise 1)')
     parser.add_argument('--repeat_exp_num', type=int, default=1)
     parser.add_argument('--display_log', action='store_true', default=False)
     
@@ -95,6 +118,8 @@ def main():
     args = parser.parse_args()
     if args.impute_batch_size < 1:
         parser.error('--impute_batch_size must be positive')
+    if args.gpu < 0:
+        parser.error('--gpu must be nonnegative')
     print(args)
     print('--'*20)
     print(f'[Config] Missing Pattern: {args.corrupt}')
@@ -103,16 +128,11 @@ def main():
     # Set --gpu explicitly when running on a multi-GPU machine.  The rest of
     # the project receives a normal torch.device object from this block.
     with startup_stage('Select device and initialize random seeds'):
-        if torch.cuda.is_available():
-            # cuda = auto_select_gpu()                      # auto select most suitable GPU
-            cuda = args.gpu                                 # manual selection of gpu
-            print(f'[Config] Using GPU {args.gpu}')
-            os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-            os.environ['CUDA_VISIBLE_DEVICES'] = str(cuda)
-            device = torch.device('cuda:{}'.format(args.gpu))
-        else:
-            print('[Config] Using CPU')
-            device = torch.device('cpu')
+        try:
+            device = select_training_device(args.gpu)
+        except ValueError as error:
+            parser.error(str(error))
+        print(f'[Config] --gpu {args.gpu} -> {device}', flush=True)
 
         seed = args.seed
         np.random.seed(seed)

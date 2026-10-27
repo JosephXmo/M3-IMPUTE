@@ -236,7 +236,7 @@ python train_mdi.py \
   uci --data yacht --train_edge 0.7
 ```
 
-没有 GPU 时删掉 `--gpu 0` 即可，程序会回退到 CPU。多 GPU 机器上请显式指定 `--gpu`；默认值是 `1`，不一定是当前可用的设备。
+设备编号由 `torch.backends.mps.is_available()` 决定：MPS 可用时，`--gpu 0` 使用 MPS，`--gpu 1` 使用 `cuda:0`，后续依次递增；MPS 不可用时，`--gpu N` 直接使用 `cuda:N`。所选 CUDA 后端不可用时提示并回退到 CPU，可见 CUDA 设备编号越界则报错。训练入口默认编号在 MPS 可用时为 `0`，否则保留 `1`；多 GPU 机器请显式指定。CUDA 编号基于外部环境已配置的可见设备，程序不再重写 `CUDA_VISIBLE_DEVICES`。
 
 用于正式回归实验的一个常见配置如下：
 
@@ -267,7 +267,7 @@ bash run_exp3_ablation.sh
 
 脚本中的参数数量较多，建议先用 `--epochs 10` 验证数据路径、设备和张量形状，再恢复论文实验的 epoch 数和重复次数。
 
-训练启动时默认输出 `[Startup]` 阶段提示，无需 `--display_log`。每步开始前立即刷新输出，结束后显示秒数：依赖导入、设备和随机种子、TXT 读取、MinMax 归一化、双向图构建、缺失掩码和边划分、模型初始化、张量搬运、稠密值/可见性矩阵、优化器。CUDA 初始化步骤在结束时同步，以便耗时包含实际 GPU 工作；同步不加到 epoch 循环里。
+训练启动时默认输出 `[Startup]` 阶段提示，无需 `--display_log`。每步开始前立即刷新输出，结束后显示秒数：依赖导入、设备和随机种子、TXT 读取、MinMax 归一化、双向图构建、缺失掩码和边划分、模型初始化、张量搬运、稠密值/可见性矩阵、优化器。CUDA/MPS 初始化步骤在结束时同步，以便耗时包含实际 GPU 工作；同步不加到 epoch 循环里。
 
 UCI 的边列表和边值构建按行显示 tqdm（完成行数、速度、预计剩余时间）；启用冷启动划分或 MAR/MNAR 时，相应的边筛选或缺失机制拟合也显示进度。TXT 读取及单次张量操作没有可靠的内部百分比，因此显示开始/结束与耗时。看到 `[Startup] Training ready` 后进入 `[Train] Epochs` 进度条。HAR 对照包装器以无缓冲模式启动训练子进程，重定向日志时也能及时看到阶段输出。
 
@@ -422,7 +422,7 @@ python downstream_task.py --method m3-impute
 
 **出现 NaN**：先检查原始数据是否有 NaN/Inf，再检查学习率和隐藏维度。缺失机制是训练时模拟的，输入文件本身应先保持完整。
 
-**CUDA 设备错误**：显式指定有效的 `--gpu`，或在无 CUDA 环境中删除该参数。程序会在 CUDA 不可用时使用 CPU。
+**CUDA 设备错误**：显式指定有效的 `--gpu`；MPS 可用时 CUDA 编号需加 1，例如 `--gpu 1` 对应 `cuda:0`。所选 CUDA 后端不可用时使用 CPU。
 
 **运行很慢或显存不足**：FCU/SRU 报 OOM 时先降低 `--impute_batch_size`，例如 `1024 → 512 → 256`；GNN 编码报 OOM 时降低 `node_dim`、`edge_dim`。`sample_peer_size` 也影响 SRU 的每批开销；大数据集采用 cosine peer 时可使用 `--very_large_dataset`。完整图的边数约为 `2 × N × M`，预测头分块不能消除全图编码显存。
 
