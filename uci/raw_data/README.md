@@ -6,7 +6,7 @@ The datasets used in this work can obtains online or import from the suppmentary
   - concrete, energy, housing, kin8nm, naval, power, wine, yacht
 - Extra 16 datasets: 
   - airfoil, blood, breast, diabetes, ionosphere, iris, wine-white, protein, spam, letter, ai4i, cmc, german, steel, libras, california-housing
-- UCI-HAR: `har/original` contains the source distribution; run `har/preprocess.py` to create `har/data`.
+- UCI-HAR: `har/original` contains the official source distribution. Use `har_cross_comparison/preprocess_cross_comparison.py` for the staged input comparison; see [the guide](har_cross_comparison/CROSS_COMPARISON_GUIDE.md). Full-population joint training uses the repository-root `train_joint.py` directly.
 
 
 Expected folder structure:

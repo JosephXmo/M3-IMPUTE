@@ -9,7 +9,18 @@ uci/results
 legacy
 uci/raw_data/har/original
 uci/raw_data/har/data
-uci/raw_data/har_cross_train/data
-!uci/raw_data/har/data/split_data_train_test.py
+uci/raw_data/har_cross_comparison/data
 mhealth/original
 uv.lock
+runs/joint/
+
+# Juicer is maintained in XHAR-SDCN and copied here manually for local use.
+/delivery/
+
+# Local checks, machine-specific configs and validation evidence stay on disk.
+/local_tests/
+test_*.py
+tests/
+/joint/configs/local_*.json
+/joint/LOCAL_*.md
+/joint/LOCAL_*.json

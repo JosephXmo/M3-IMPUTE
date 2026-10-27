@@ -18,13 +18,13 @@ import sys
 import numpy as np
 
 
-HAR_DIR = Path(__file__).resolve().parent
-M3_ROOT = HAR_DIR.parents[2]
+EXPERIMENT_DIR = Path(__file__).resolve().parent
+M3_ROOT = EXPERIMENT_DIR.parents[2]
 XHAR_ROOT = M3_ROOT.parent / "XHAR-SDCN"
 DEFAULT_OUTPUT = XHAR_ROOT / "data" / "missing-cross-comparison"
-TRAIN_NAME = "har_cross_train"
+TRAIN_NAME = "har_cross_comparison"
 TRAIN_DATA = M3_ROOT / "uci" / "raw_data" / TRAIN_NAME / "data"
-CONFIG_DIR = Path("experiments/har_missing_10rows_102cols")
+CONFIG_DIR = Path("experiments/input_impute_cross_comparison")
 
 
 def digest(path: Path) -> str:
@@ -298,9 +298,9 @@ def impute(args: argparse.Namespace) -> None:
     if args.chunk_size < 1:
         raise ValueError("chunk-size must be positive")
     # Torch imports are delayed so all preparation works with NumPy.
-    if str(HAR_DIR) not in sys.path:
-        sys.path.insert(0, str(HAR_DIR))
-    from generate_m3_representation import (
+    if str(EXPERIMENT_DIR) not in sys.path:
+        sys.path.insert(0, str(EXPERIMENT_DIR))
+    from cross_comparison_inference import (
         choose_device, load_module, impute_missing,
     )
     import torch
@@ -370,7 +370,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="stage", required=True)
     prep = sub.add_parser("prepare", help="randomly split rows, simulate missingness, export baselines")
-    prep.add_argument("--source", type=Path, default=HAR_DIR / "original/UCI HAR Dataset")
+    prep.add_argument("--source", type=Path, default=EXPERIMENT_DIR.parent / "har/original/UCI HAR Dataset")
     prep.add_argument("--train-ratio", type=float, default=0.7)
     prep.add_argument("--rate", type=float, default=0.1, help="cell-level MCAR missing probability")
     prep.add_argument("--seed", type=int, default=42)

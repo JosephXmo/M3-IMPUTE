@@ -12,7 +12,7 @@ M3-XHAR 联合训练不在此流程内。
 ### 准备 S_train、S₀、S_drop，更新三个 XHAR 配置的数据路径
 
 ```bash
-python uci/raw_data/har/preprocess_cross_comparison.py prepare \
+python uci/raw_data/har_cross_comparison/preprocess_cross_comparison.py prepare \
   --rate 0.10 --seed 42 --update-xhar-configs
 ```
 
@@ -24,7 +24,7 @@ python uci/raw_data/har/preprocess_cross_comparison.py prepare \
 ### 64/64 训练并保存权重
 
 ```bash
-python uci/raw_data/har/preprocess_cross_comparison.py train \
+python uci/raw_data/har_cross_comparison/preprocess_cross_comparison.py train \
   --node-dim 64 --edge-dim 64 --epochs 200 --gpu 0 \
   --apply-attr --apply-peer --impute-batch-size 1024 \
   --log-dir cross_random_64_64_seed42
@@ -33,7 +33,7 @@ python uci/raw_data/har/preprocess_cross_comparison.py train \
 ### 32/16 训练并保存权重，降低表示宽度以节约显存
 
 ```bash
-python uci/raw_data/har/preprocess_cross_comparison.py train \
+python uci/raw_data/har_cross_comparison/preprocess_cross_comparison.py train \
   --node-dim 32 --edge-dim 16 --epochs 200 --gpu 0 \
   --apply-attr --apply-peer --impute-batch-size 1024 \
   --log-dir cross_random_32_16_seed42
@@ -48,7 +48,7 @@ python uci/raw_data/har/preprocess_cross_comparison.py train \
 例如，重跑 12/10 配置：
 
 ```bash
-python uci/raw_data/har/preprocess_cross_comparison.py train \
+python uci/raw_data/har_cross_comparison/preprocess_cross_comparison.py train \
   --node-dim 12 --edge-dim 10 --epochs 200 --gpu 0 \
   --apply-attr --apply-peer --impute-batch-size 1024 \
   --log-dir cross_random_12_10_seed42_batched
@@ -67,7 +67,7 @@ python uci/raw_data/har/preprocess_cross_comparison.py train \
 32/16 权重及训练来源记录保存在：
 
 ```text
-uci/test/har_cross_train/cross_random_32_16_seed42/
+uci/test/har_cross_comparison/cross_random_32_16_seed42/
 ├── model.pt                   # 完整 GNNStack 模块
 ├── impute_model.pt            # 完整 ImputeNet 模块
 └── cross_comparison.json      # 训练数据与权重的 SHA-256、命令及 seed
@@ -80,8 +80,8 @@ uci/test/har_cross_train/cross_random_32_16_seed42/
 ### 使用训练好的权重生成 S_m3
 
 ```bash
-python uci/raw_data/har/preprocess_cross_comparison.py impute \
-  --checkpoint-dir uci/test/har_cross_train/cross_random_32_16_seed42 \
+python uci/raw_data/har_cross_comparison/preprocess_cross_comparison.py impute \
+  --checkpoint-dir uci/test/har_cross_comparison/cross_random_32_16_seed42 \
   --device cuda:0 --chunk-size 128
 ```
 
@@ -93,7 +93,7 @@ cosine peer 模式会从可见 S₀ 数据重新建缓存，把负采样权重�
 `--chunk-size` 只控制每次 ImputeNet 调用的缺失目标单元格数；GNN 编码仍处理整个 S₀ 可见图。
 减小它能降低预测头峰值显存，不能消除全图编码的显存消耗。
 `--device cpu` 可用于没有 CUDA 的环境，但仍需足够内存。
-当前本地没有完成这一步所需的真实训练权重；不能用 S_drop 冒充 S_m3。
+此步骤必须使用对应 S_train 实际训练的权重；不能用 S_drop 冒充 S_m3。
 
 已有全 HAR 权重见过 S₀，旧被试划分的权重也不对应新 S_train；两者都不能用于本次对照，必须重新训练。
 补全阶段要求本包装器训练后生成的 `cross_comparison.json`，并核对训练数据及权重摘要，避免误用旧权重。
@@ -151,7 +151,7 @@ S_drop 保留全部 3090 行，名字中的 drop 表示特征被遮挡。
 `s0_row_ids.txt` 与 `train_row_ids.txt` 是相对于完整 train+test 的原始行号；`s0_subjects.txt` 保存 S₀ 被试编号。
 `hhar_missing.txt` 是显式 NaN 版本，供核验或其他补全方法使用，不用作 XHAR 输入。
 
-训练输入另外保存在 M3 仓库的 `uci/raw_data/har_cross_train/data/data.txt`（7209 × 562）：
+训练输入另外保存在 M3 仓库的 `uci/raw_data/har_cross_comparison/data/data.txt`（7209 × 562）：
 最后一列仅为兼容 UCI loader 的 HAR 标签列，M3 补全只使用前 561 列。
 旧 `uci/raw_data/har/data` 和其他数据集保持原样。
 
@@ -164,24 +164,49 @@ manifest schema 2 记录随机划分规则、共享被试、训练数据、掩�
 
 ```bash
 cd ../XHAR-SDCN
-bash experiments/har_missing_10rows_102cols/run_all.sh
+bash experiments/input_impute_cross_comparison/run_all.sh
 ```
 
-结果写入独立的 `statistics/cross-random-*/` 目录，包含本轮 Parquet、manifest 副本、三组对照图和 27 行指标范围 CSV，避免混入旧划分的结果。
+结果写入独立的 `experiments/input_impute_cross_comparison/results/cross-random-*/` 目录，包含本轮 Parquet、manifest 副本、三组对照图和 27 行指标范围 CSV，避免混入旧划分的结果。
 现有五次重复的 seed 均为 42，不能把它们解释为独立随机种子误差范围。
 
 也可以逐组执行：
 
 ```bash
 source .venv/bin/activate
-python train.py -C experiments/har_missing_10rows_102cols/hhar_s0.yaml
-python train.py -C experiments/har_missing_10rows_102cols/hhar_drop.yaml
-python train.py -C experiments/har_missing_10rows_102cols/hhar_m3.yaml
+python train.py -C experiments/input_impute_cross_comparison/hhar_s0.yaml
+python train.py -C experiments/input_impute_cross_comparison/hhar_drop.yaml
+python train.py -C experiments/input_impute_cross_comparison/hhar_m3.yaml
 ```
 
 自动配置更新只替换三份 YAML 的 X_path/y_path，其余设备、图参数、AE 预热、模型、训练和 seed 设置不变。
-目录保留旧实验名，但 active 数据路径指向新产物。手动执行仍使用 YAML 的 `statistics_path: auto`，分析时须自行区分新旧结果。
+单独运行 YAML 默认写入实验目录的 `results/manual/{s0,dropped,imputed}.parquet`，
+再次执行会覆盖同名 manual 文件。批量脚本为每次调用创建唯一目录，并保存 manifest
+与配置快照。绘图脚本也位于实验目录，需显式选择结果批次：
+
+```bash
+python experiments/input_impute_cross_comparison/plot_har_statistics.py \
+  --statistics-dir experiments/input_impute_cross_comparison/results/cross-random-XXXXXXXX
+```
+
+将末尾目录名替换为实际批次。默认使用 Z 分布，图保存在选定批次中。
+完整参数和历史结果绘图方式见 XHAR 的实验 README。
 
 补全后 manifest 记录隐藏单元格的 MAE/RMSE（原始特征单位），另行比较 XHAR 的 ACC/NMI/ARI 等下游指标。
-局部测试：`PYTHONPATH=uci/raw_data/har:. python -m unittest uci/raw_data/har/test_cross_comparison.py -v`。
-测试覆盖随机划分的互斥/完整/可复现、特征与标签对齐、训练统计量、掩码、旧产物失效及真实 ImputeNet 的新样本数量适配；不替代全量 HAR 训练与目标 GPU 验收。
+
+## 5. 维护范围
+
+本实验集中于 `uci/raw_data/har_cross_comparison/`，包含流水线、推理模块、本指南和
+本地 `data/`。原始数据仍读取 `uci/raw_data/har/original/UCI HAR Dataset`。
+目录迁移只移动既有训练数据，不重建划分或更改文件内容。
+
+`preprocess_cross_comparison.py` 提供 prepare / train / impute 三个阶段。
+`cross_comparison_inference.py` 仅负责完整模块 checkpoint 加载、可见图构造和分块补全，
+由 impute 阶段调用；没有独立 representation 导出入口。
+本目录仅维护上述代码及本指南，测试和机器专属记录不随仓库分发。
+全量 M3 → Juicer 联合训练使用根目录 `train_joint.py`，不复用本流程的随机 7–3 行划分。
+
+新训练使用数据集名 `har_cross_comparison`，checkpoint 写入
+`uci/test/har_cross_comparison/<log-dir>/`。历史 `uci/test/har_cross_train/` 权重、命令
+及 manifest 中的旧路径不改写。使用历史权重时仍显式传入实际 `--checkpoint-dir`；
+补全依旧核对训练矩阵和模型哈希，不能因目录改名而绕过来源检查。

@@ -19,14 +19,18 @@ models/prediction_model.py   FCU、SRU 和 ImputeNet 预测头
 
 ## 1. 安装环境
 
-M3 训练依赖 PyTorch、PyTorch Geometric、NumPy、SciPy、scikit-learn、pandas 和 matplotlib。基线及其他工具另外使用 `fancyimpute` 等库；仓库提供了综合依赖列表：
+主项目统一使用 `pyproject.toml` 和 uv 环境管理依赖；其中已经包含联合聚类指标所需的
+`munkres`，不再维护 joint 专用依赖列表。
 
 ```bash
-python -m venv .venv
+uv sync
 source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
 ```
+
+Juicer package 在 XHAR-SDCN 的 `delivery/` 中维护，使用联合训练时手动复制到本仓库
+`delivery/` 并安装进同一环境。该副本被 Git 忽略，安装和远端部署步骤见
+[joint/DEPLOYMENT.md](joint/DEPLOYMENT.md)。后续若重新执行 `uv sync`，需再次安装
+这个不在主项目依赖清单中的本地 package。
 
 核心训练不再直接依赖 `torch-scatter`：EGCN 的度数求和使用 PyG 的 `scatter(..., reduce='sum')`，EGSAGE 不需要导入该扩展。PyG 的这些求和路径可使用 PyTorch 原生算子；因此可以先只安装与 GPU 架构兼容的 PyTorch 和 PyG，避免被旧扩展 wheel 限制。先确认版本：
 
@@ -106,103 +110,27 @@ python train_mdi.py --epochs 1 --log_dir mhealth_smoke mhealth --data mhealth --
 
 ### UCI-HAR 数据集
 
-被试分离的 M3 → XHAR 四组对照（S₀、均值占位、相似度插值、M3 补全）使用独立流水线，详见 [中文实验指南](uci/raw_data/har/CROSS_COMPARISON_GUIDE.md)。该流程使用训练集统计量，并保持四组下游输入尺寸一致。
+当前保留两条独立流程，都直接读取官方 561 维特征表：
 
-仓库中的 `uci/raw_data/har/original` 是 UCI-HAR 原始目录。可以使用预处理脚本合并官方 train/test 文件，并按指定比例生成缺失单元：
+- **离线 cross comparison**：随机排列全量 UCI-HAR，以 7209 行训练 M3，其余
+  3090 行构成 S₀；比较 S₀、均值占位 S_drop 和 M3 补全 S_m3 三种 XHAR 输入。
+  使用 S_train 的缩放和均值统计，行集合互斥但 subject 可以重叠。入口及命令见
+  [CROSS_COMPARISON_GUIDE.md](uci/raw_data/har_cross_comparison/CROSS_COMPARISON_GUIDE.md)。
+- **全量联合训练**：全部 10,299 行进入 M3，每轮自动挖空；M3 重构特征直接进入
+  Juicer，XHAR 损失反传到 M3，活动标签仅用于聚类指标。入口为 `train_joint.py`，
+  详见[部署指南](joint/DEPLOYMENT.md)和[数据流图](joint/DATA_FLOW.md)。
 
-```bash
-cd uci/raw_data/har
-python preprocess.py --rate 0.1 --seed 0
-python data/split_data_train_test.py
-```
+`uci/raw_data/har_cross_comparison/` 的维护代码为 `preprocess_cross_comparison.py` 和其专用补全模块
+`cross_comparison_inference.py`，配套说明为 `CROSS_COMPARISON_GUIDE.md`。
+旧全量预处理、representation 导出和四路比较入口已退役。
+`uci/raw_data/har/data/split_data_train_test.py` 按原仓库约定保留。
+已有原始数据、生成数据和历史结果继续留在本地，不由此整理重新生成。
 
-脚本会生成 561 个特征和 1 个活动标签列。完整的 `data/data.txt` 供当前 M3-Impute 加载器使用；模拟挖空结果保存在 `data/data_with_missing.txt`，行列位置保存在 `data/missing_indices.txt` 和 `data/missing_mask.txt`。由于当前 `uci_data.load_data()` 要求输入矩阵为有限值，训练命令应继续指向完整的 `data.txt`，缺失率由 `--train_edge`/`--known` 或后续读取 `missing_indices.txt` 的实验逻辑控制。
+XHAR 的离线实验入口现在位于 `experiments/input_impute_cross_comparison/`，新结果
+放在该目录的 `results/` 中。它与全量联合训练的划分和指标协议分别管理。
 
-默认的 `split_data_train_test.py` 保留 UCI-HAR 原有的 7352/2947 行 subject 划分。如果需要和其它数据集一样生成 20 个随机 90/10 划分，可以运行：
-
-```bash
-python data/split_data_train_test.py --random-splits
-```
-
-### 用训练好的 M3 导出 HAR representation
-
-训练并保存 HAR 的 M3 checkpoint 后，可以用独立脚本对缺失数据进行补全，再用同一个 `GNNStack` 编码完整数据和补全数据：
-
-```bash
-python uci/raw_data/har/generate_m3_representation.py \
-  --model-path uci/test/har/<实验目录>/model.pt \
-  --impute-model-path uci/test/har/<实验目录>/impute_model.pt \
-  --output-dir uci/raw_data/har/representation \
-  --chunk-size 512 \
-  --device cuda:0
-```
-
-脚本会生成：
-
-```text
-har_complete_representation.txt
-har_missing_imputed_representation.txt
-har_missing_imputed_features.txt
-har_missing_imputed_data.txt
-har_labels.txt
-har_manifest.json
-```
-
-其中两个 `representation.txt` 都是样本节点表示，行顺序与 HAR 原始数据一致；通常列数等于 M3 的 `node_dim`，但启用 `concat_states` 时以实际导出的 `representation_dim` 为准。完整数据和缺失数据使用同一个 scaler、同一个 checkpoint 和同一个编码流程；缺失输入会先由 `ImputeNet` 补全，再进行全可见编码。`--chunk-size` 只分块处理 ImputeNet 目标边，GNN 编码本身仍然是整图计算。
-
-如果 XHAR-SDCN 使用 M3 representation 作为 `X_path`，其 `n_input` 必须设置为 `representation_dim`，并且需要重新训练一个输入维度相同的 XHAR-SDCN autoencoder checkpoint。例如 M3 `node_dim=64` 时：
-
-```yaml
-name: "har"
-X_path: "data/har_missing_imputed_representation.txt"
-y_path: "data/har_labels.txt"
-graph_path: "graph/hhar5_graph.txt"
-pretrain_path: "data/har_m3_pretrain_64.pkl"
-n_input: 64
-n_clusters: 6
-```
-
-现有 `hhar.pkl` 是 561 维输入的预训练模型，不能直接加载到 64 维 M3 representation 上。如果希望继续复用现有 561 维 XHAR-SDCN 配置，应使用脚本输出的 `har_missing_imputed_features.txt`，并将 `n_input` 保持为 561。
-
-### UCI-HAR 的 XHAR-SDCN 四路比较
-
-`UCI HAR Dataset/features_info.txt` 说明了 561 列的来源：原始 50 Hz 三轴传感器信号经过滤波、body/gravity 分解、jerk/magnitude 构造、FFT 和统计量计算后，每个窗口得到一个 561 维特征向量。`X_train` 和 `X_test` 拼接后正好是 10299×561，与 XHAR-SDCN 的 `data/hhar.txt` 对应。因此主实验应直接比较 561 维特征，避免把“缺失补全”和“representation 生成”两个因素混在一起。
-
-当前 cell-level `rate=0.1` 会让几乎每一行都含缺失，`S_drop` 将没有可用样本。四路比较采用可复现的行级掩码时，可运行：
-
-```bash
-python uci/raw_data/har/prepare_xhar_comparison.py \
-  --mask-mode row \
-  --row-fraction 0.1 \
-  --cells-per-row 102 \
-  --rate 0.1 \
-  --seed 0 \
-  --output-tag har_missing_10rows_102cols \
-  --batch-size 512 \
-  --epochs 200
-```
-
-这里的实际全局缺失率是 `0.1×102/561≈1.82%`；`rate` 表示目标全局比例，但显式指定的 `cells-per-row` 优先。脚本会生成固定掩码的 `S′₀`、线性插值的 `S_lerp`、删除含缺失行并重映射图后的 `S_drop`，以及三份使用相同 XHAR-SDCN 超参数的 YAML。`S0`、`S_lerp` 与 `S_drop` 的文件位于 XHAR-SDCN 的 `data/har_missing_10rows_102cols/`，配置和运行脚本位于 `experiments/har_missing_10rows_102cols/`。
-
-得到 M3 的 `har_missing_imputed_features.txt` 后，用同一掩码补入第四路：
-
-```bash
-python uci/raw_data/har/prepare_xhar_comparison.py \
-  --mask-file /Users/joseph_phantom/CodingCenter/XHAR-SDCN/data/har_missing_10rows_102cols/hhar_missing_mask.txt \
-  --m3-features uci/raw_data/har/representation/har_missing_imputed_features.txt \
-  --output-tag har_missing_10rows_102cols \
-  --batch-size 512 \
-  --epochs 200
-```
-
-然后在 XHAR-SDCN 根目录运行 `experiments/har_missing_10rows_102cols/run_all.sh`。`S0`、`S_M3`、`S_lerp` 都保持 10299 行；`S_drop` 单独使用 9269 行及其重映射 graph。四路应固定模型、epoch、batch size、学习率、随机种子和 `data/hhar.pkl`；只有 `X_path`、标签文件以及 `S_drop` 的 graph 不同。统计结果由 XHAR-SDCN 的 `P` 分布行提供，`scripts/summarize_har_statistics.py` 可汇总最终和诊断用的最佳 NMI/ARI：
-
-```bash
-python scripts/summarize_har_statistics.py \
-  statistics/har_missing_10rows_102cols_*.csv
-```
-
-正式结论应使用多个训练 seed 的均值±标准差；`S_drop` 还必须单独报告保留的样本数，不能只比较聚类指标。
+本地测试代码集中保存在被 Git 忽略的 `local_tests/`。`joint/configs/local_*.json`
+及 `joint/LOCAL_*` 记录也仅留在本机；仓库保留运行代码、远端起始配置和通用部署说明。
 
 ## 3. 从表格到图的含义
 

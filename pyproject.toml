@@ -19,4 +19,5 @@ dependencies = [
     "torch==2.12.1",
     "torch-geometric>=2.8.0.post1",
     "torchvision==0.27.1",
+    "munkres==1.1.4",
 ]
